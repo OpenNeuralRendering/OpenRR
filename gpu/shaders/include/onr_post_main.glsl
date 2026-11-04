@@ -12,7 +12,7 @@
 // POST_DELTA (post_dlt.comp, post_fixup_dlt.comp): the tile's free halves 6, 10, 11 hold the log delta of an
 // edited network image (dfn_import.comp), splatted with the same weights as the network's own image. Everything the
 // network keeps is computed as without an edit; the edit reaches only the displayed image, as that delta kept in a
-// history of its own: reprojected with the strongest of InternalHistory's candidates (bilinear), blended toward this
+// history of its own: reprojected with the strongest of InternalHistory's candidates (Catmull-Rom), blended toward this
 // frame's delta at a2 (at least dh_alpha where that candidate moves), added to the displayed blend's fp16 log value.
 #include "onr_common.glsl"
 #include "onr_post.glsl"
@@ -156,12 +156,25 @@ vec3 dunpack(uint u) { return vec3(dunpack1(u & 0x7ffu, 4u), dunpack1((u >> 11) 
 
 vec3 dh_texel(int x, int y) { return dunpack(AT32(U32Buf, pc.dh_in, y * pc.size.x + x, 4u).v[0]); }
 
-vec3 dh_bilinear(float px, float py) {
+// Catmull-Rom on the 12 taps without the corners: at a low rate a bilinear reprojection blurs the delta in motion.
+// On a texel centre (a still camera) it is that texel.
+vec3 dh_catrom(float px, float py) {
     float bx = px - 0.5, by = py - 0.5;
     float ix = floor(bx), iy = floor(by), fx = bx - ix, fy = by - iy;
-    int x0 = clamp(int(ix), 0, pc.size.x - 1), x1 = clamp(int(ix) + 1, 0, pc.size.x - 1);
-    int y0 = clamp(int(iy), 0, pc.size.y - 1), y1 = clamp(int(iy) + 1, 0, pc.size.y - 1);
-    return mix(mix(dh_texel(x0, y0), dh_texel(x1, y0), fx), mix(dh_texel(x0, y1), dh_texel(x1, y1), fx), fy);
+    vec4 wx = 0.5 * vec4(fx * (fx * (2.0 - fx) - 1.0), fx * fx * (3.0 * fx - 5.0) + 2.0, fx * (fx * (4.0 - 3.0 * fx) + 1.0), fx * fx * (fx - 1.0));
+    vec4 wy = 0.5 * vec4(fy * (fy * (2.0 - fy) - 1.0), fy * fy * (3.0 * fy - 5.0) + 2.0, fy * (fy * (4.0 - 3.0 * fy) + 1.0), fy * fy * (fy - 1.0));
+    ivec4 cx = clamp(int(ix) + ivec4(-1, 0, 1, 2), ivec4(0), ivec4(pc.size.x - 1));
+    ivec4 cy = clamp(int(iy) + ivec4(-1, 0, 1, 2), ivec4(0), ivec4(pc.size.y - 1));
+    vec3 r = vec3(0.0);
+    float total = 0.0;
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i) {
+            if ((i == 0 || i == 3) && (j == 0 || j == 3)) continue;
+            float w = wx[i] * wy[j];
+            r += w * dh_texel(cx[i], cy[j]);
+            total += w;
+        }
+    return r / total;
 }
 #endif
 
@@ -334,7 +347,7 @@ void pixel(int X, int Y, float fx, float fy, Splat sp, out vec3 out1, out vec3 o
         if (i == 0) {
             cum = w;
 #ifdef POST_DELTA
-            dacc = ok ? dh_bilinear(px, py) : dcur;   // the first (strongest) candidate only
+            dacc = ok ? dh_catrom(px, py) : dcur;   // the first (strongest) candidate only
 #endif
         } else {
             cum = cum + w;
@@ -367,8 +380,8 @@ void pixel(int X, int Y, float fx, float fy, Splat sp, out vec3 out1, out vec3 o
     precise vec3 o2 = fma(d, vec3(a2), h_lin);
 #ifdef POST_DELTA
     vec3 dprev = (pc.reset & 4u) != 0u ? dcur : dacc;
-    // the display's own rate a2, so the delta averages over the jitter as the image does; dh_alpha only where the
-    // bilinear reprojection moves (half a pixel or more), to keep its blur short
+    // the display's own rate a2, so the delta averages over the jitter as the image does; a floor of dh_alpha where
+    // the camera moves (half a pixel or more), and a2 itself where RR drops its history (a disocclusion)
     float dmove = clamp(2.0 * length(vec2(cs[0].mx, cs[0].my)), 0.0, 1.0);
     dlt = mix(dprev, dcur, edited ? max(pc.dh_alpha * dmove, a2) : 0.0);
     if (any(isnan(dlt))) dlt = vec3(0.0);

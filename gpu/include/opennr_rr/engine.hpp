@@ -163,7 +163,7 @@ private:
     I2 render_{}, output_{}, internal_{}, ds_{}, ds2_{}, pad_{};
     uint64_t frame_ = 0;
     uint64_t nr_frame_ = ~0ull;   // frame_ of the last post that wrote the delta history
-    float dh_alpha_ = 0.3f;
+    float dh_alpha_ = 0.05f;
     bool fresh_ = true;
     bool tile_late_ = false;   // record_post builds the post tile (post_tile) instead of the dec0_1 head
     bool sampler_ = true;

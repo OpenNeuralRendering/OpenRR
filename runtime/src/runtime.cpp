@@ -2748,6 +2748,12 @@ int32_t GetLastErrorText(char* buf, uint32_t n) {
 
 }  // namespace
 
+extern "C" int32_t OnrRrSetDeltaRate(void* context, float rate) {
+    if (!context || !(rate > 0.0f)) return ONR_RR_INVALID_ARGUMENT;
+    static_cast<Ctx*>(context)->engine.set_delta_alpha(std::min(rate, 1.0f));
+    return ONR_RR_OK;
+}
+
 extern "C" int32_t OnrRrGetApi(uint32_t abi, OnrRrApi* api) {
     if (abi < ONR_RR_ABI_VERSION || abi > ONR_RR_ABI_VERSION_5 || !api) return ONR_RR_INVALID_ARGUMENT;
     if (abi >= ONR_RR_ABI_VERSION_5) {

@@ -19,6 +19,7 @@
 #include <dxgi1_6.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -307,6 +308,74 @@ int wmain(int argc, wchar_t** argv) {
             ci2.max_render_width = 426, ci2.max_render_height = 240, ci2.output_width = 640, ci2.output_height = 360;
             if (api.Create(&ci2, &idle)) throw std::runtime_error("Create (idle)");
         }
+        // ONR_VALIDATE_SECOND=1 (D3D12 backend): a second feature as a game's small secondary view, 426x240 -> 640x360 over
+        // the scene's top-left corner, made between the main feature's Record and its submit at frame ONR_VALIDATE_SECOND_AT
+        // (default 2); its frames go on a compute queue of their own, submitted beside the main ones.
+        // ONR_VALIDATE_SECOND_CHURN=n: after n network frames it is destroyed with its last frame in flight and made again
+        // on another thread at the other size (376x211 -> 564x317, and back; ONR_VALIDATE_SECOND_GAP=ms waits before making
+        // it). ONR_VALIDATE_SECOND_SOLO=1: the main feature
+        // records but its lists never run (the second's reference). ONR_VALIDATE_SECOND_LOG=<file>: a hash per network frame
+        // of the second; ONR_VALIDATE_MAIN_LOG=<file>: a hash per frame of the main one, loop frames included.
+        const bool second_on = getenv("ONR_VALIDATE_SECOND") != nullptr;
+        const bool solo = second_on && getenv("ONR_VALIDATE_SECOND_SOLO") != nullptr;
+        const int second_at = getenv("ONR_VALIDATE_SECOND_AT") ? atoi(getenv("ONR_VALIDATE_SECOND_AT")) : 2;
+        const uint32_t churn = getenv("ONR_VALIDATE_SECOND_CHURN") ? uint32_t(atoi(getenv("ONR_VALIDATE_SECOND_CHURN"))) : 0;
+        FILE* slog = getenv("ONR_VALIDATE_SECOND_LOG") ? fopen(getenv("ONR_VALIDATE_SECOND_LOG"), "w") : nullptr;
+        FILE* mlog = getenv("ONR_VALIDATE_MAIN_LOG") ? fopen(getenv("ONR_VALIDATE_MAIN_LOG"), "w") : nullptr;
+        constexpr UINT SW = 426, SH = 240;
+        const UINT ssize[2][4] = {{426, 240, 640, 360}, {376, 211, 564, 317}};
+        const UINT64 s_stride = UINT64((SW * 8 + 255) & ~255u) * SH;
+        ID3D12CommandQueue* q2 = nullptr;
+        ID3D12CommandAllocator* sal = nullptr;
+        ID3D12GraphicsCommandList* scl = nullptr;
+        ID3D12Fence* sfence = nullptr;
+        uint64_t sfv = 0;
+        Tex stex[8], sout[2];
+        ID3D12Resource *sup = nullptr, *srb[2] = {};
+        uint8_t* smap = nullptr;
+        std::atomic<void*> s_ctx{nullptr};
+        std::thread s_maker;
+        bool s_started = false;
+        int s_cycle = 0;
+        uint32_t s_net = 0;   // its network frames, all cycles
+        if (second_on) {
+            D3D12_COMMAND_QUEUE_DESC cqd{D3D12_COMMAND_LIST_TYPE_COMPUTE};
+            hr_check(dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&q2)), "queue (second)");
+            hr_check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&sal)), "allocator (second)");
+            hr_check(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, sal, nullptr, IID_PPV_ARGS(&scl)), "list (second)");
+            scl->Close();
+            hr_check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&sfence)), "fence (second)");
+            for (int i = 0; i < 8; ++i) stex[i] = make_tex(SW, SH, gs[i].f, gs[i].bpp, gs[i].fl, SRV);
+            for (int k = 0; k < 2; ++k) {
+                sout[k] = make_tex(ssize[k][2], ssize[k][3], DXGI_FORMAT_R16G16B16A16_FLOAT, 8, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                srb[k] = make_buf(UINT64(ssize[k][2]) * 8 * ssize[k][3], D3D12_HEAP_TYPE_READBACK);
+            }
+            sup = make_buf(s_stride * 8, D3D12_HEAP_TYPE_UPLOAD);
+            sup->Map(0, nullptr, reinterpret_cast<void**>(&smap));
+            if (re9) printf("second feature: the guides in the default formats (ONR_VALIDATE_RE9 is for the main one)\n");
+        }
+        auto make_second = [&api, ci, &ssize](int k) -> void* {
+            OnrRrCreateInfo c2 = ci;
+            c2.max_render_width = ssize[k][0], c2.max_render_height = ssize[k][1], c2.output_width = ssize[k][2], c2.output_height = ssize[k][3];
+            void* p = nullptr;
+            if (api.Create(&c2, &p)) {
+                char e[512] = {};
+                api.GetLastError(e, sizeof e);
+                printf("Create (second): %s\n", e);
+                return nullptr;
+            }
+            return p;
+        };
+        auto wait_second = [&] {
+            q2->Signal(sfence, ++sfv);
+            if (sfence->GetCompletedValue() < sfv) {
+                HANDLE e2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                sfence->SetEventOnCompletion(sfv, e2);
+                if (WaitForSingleObject(e2, 20000) != WAIT_OBJECT_0) throw std::runtime_error("the second feature's queue did not finish in 20 s");
+                CloseHandle(e2);
+            }
+        };
         uint32_t backend = ONR_RR_BACKEND_VULKAN;
         if (a4.GetBackend) a4.GetBackend(ctx, &backend);
         printf("render %ux%u -> %ux%u, %d frames, %s, backend %s\n", RW, RH, OW, OH, nframes, faithful ? "faithful" : "fast",
@@ -356,6 +425,10 @@ int wmain(int argc, wchar_t** argv) {
         // ONR_VALIDATE_SHARPEN=k (D3D12 backend, a hop in rgba32f): the hop's image edited as x + k (x - box3(x)) on the
         // CPU, a stand-in for an NR that follows the jitter (the display mode's stability on a static scene)
         const float sharpen = getenv("ONR_VALIDATE_SHARPEN") ? float(atof(getenv("ONR_VALIDATE_SHARPEN"))) : 0.0f;
+        // ONR_VALIDATE_HOP_DUMP=<prefix> (same hop): the image as <prefix><frame>.raw, rgba32f rows, for an NR run outside.
+        // ONR_VALIDATE_EDIT_FILES=<prefix>: the edit is <prefix><frame>.raw, rgba16f rows, what that run gave back.
+        const char* hop_dump = getenv("ONR_VALIDATE_HOP_DUMP");
+        const char* edit_files = getenv("ONR_VALIDATE_EDIT_FILES");
         ID3D12Resource *erb = nullptr, *eup = nullptr;
 
         // guide i of frame f (the scene's rows, its formats) into gs[i]'s rows
@@ -402,6 +475,118 @@ int wmain(int argc, wchar_t** argv) {
             }
         };
         uint8_t* um = nullptr;        upload->Map(0, nullptr, reinterpret_cast<void**>(&um));
+        // the second feature's frame on scl (closed after it): its next network frame's guides, the scene's top-left corner
+        struct SecondRec { void* ctx; uint32_t before, after; int k, cycle; };
+        std::atomic<bool> s_made{false};
+        auto record_second = [&](SecondRec& sr) -> bool {
+            if (s_maker.joinable() && s_made) {
+                s_maker.join();
+                if (!s_ctx.load()) throw std::runtime_error("Create (second) failed");
+            }
+            void* sc = s_ctx.load();
+            if (!sc || s_maker.joinable()) return false;
+            OnrRrInfo si{sizeof si};
+            api.GetInfo(sc, &si);
+            if (si.state == ONR_RR_STATE_FAILED) throw std::runtime_error(std::string("second feature failed: ") + si.message);
+            const int k = s_cycle & 1, sf = int(si.frames % uint32_t(nframes));
+            sal->Reset();
+            scl->Reset(sal, nullptr);
+            for (int i = 0; i < 8; ++i) {
+                wchar_t p[MAX_PATH];
+                swprintf_s(p, L"%s\\%s\\%04d.raw", scene.c_str(), gs[i].dir, sf);
+                auto d = read_file(p);
+                const UINT bpp = gs[i].bpp, pitch = (SW * bpp + 255) & ~255u;
+                for (UINT y = 0; y < SH; ++y) memcpy(smap + s_stride * i + UINT64(y) * pitch, d.data() + size_t(y) * RW * bpp, size_t(SW) * bpp);
+                D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+                b.Transition = {stex[i].res, 0, SRV, D3D12_RESOURCE_STATE_COPY_DEST};
+                scl->ResourceBarrier(1, &b);
+                D3D12_TEXTURE_COPY_LOCATION dst{stex[i].res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                D3D12_TEXTURE_COPY_LOCATION src{sup, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                src.PlacedFootprint = {s_stride * i, {gs[i].f, SW, SH, 1, pitch}};
+                scl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                scl->ResourceBarrier(1, &b);
+            }
+            size_t at = fr0;
+            for (int q = 0; q <= sf; ++q) at = js.find("\"jitter\"", at + 1);
+            OnrRrFrame fr{};
+            fr.size = sizeof fr;
+            auto jit = json_list(js, at, "jitter"), mvs = json_list(js, at, "mv_scale"), rst = json_list(js, at, "reset");
+            auto w2v = json_list(js, at, "world_to_view"), v2c = json_list(js, at, "view_to_clip");
+            fr.render_width = ssize[k][0], fr.render_height = ssize[k][1];
+            fr.jitter_x = float(jit[0]), fr.jitter_y = float(jit[1]);
+            fr.mv_scale_x = float(mvs[0]), fr.mv_scale_y = float(mvs[1]);
+            for (int i = 0; i < 16; ++i) fr.world_to_view[i] = float(w2v[i]), fr.view_to_clip[i] = float(v2c[i]);
+            if (!rst.empty() && rst[0] != 0) fr.flags |= ONR_RR_FRAME_RESET;
+            OnrRrTexture* t[8] = {&fr.color, &fr.diffuse_albedo, &fr.specular_albedo, &fr.normals, &fr.roughness, &fr.depth, &fr.motion,
+                                  &fr.specular_hit_distance};
+            for (int i = 0; i < 8; ++i) *t[i] = OnrRrTexture{stex[i].res, uint32_t(SRV), 0, 0};
+            auto envv = [](const char* key) { const char* v = getenv(key); return v ? atoi(v) : -1; };
+            const OnrRrTexture r16{stex[4].res, uint32_t(SRV), 0, 0};
+            if (getenv("ONR_VALIDATE_DM")) fr.disocclusion_mask = r16;
+            if (getenv("ONR_VALIDATE_SSS")) fr.sss_guide = r16;
+            if (envv("ONR_VALIDATE_SMV") == 1) fr.specular_motion = fr.motion;
+            if (envv("ONR_VALIDATE_CBT") > 0) fr.color_before_transparency = envv("ONR_VALIDATE_CBT") == 1 ? fr.color : fr.normals;
+            if (envv("ONR_VALIDATE_RESP") == 1) fr.responsivity_mask = r16;
+            if (envv("ONR_VALIDATE_DOF") == 1) fr.depth_of_field_guide = r16;
+            fr.output = OnrRrTexture{sout[k].res, uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS), 0, 0};
+            void* job = nullptr;
+            if (a4.Record(sc, &fr, scl, 0, nullptr, &job)) {
+                api.GetLastError(err, sizeof err);
+                throw std::runtime_error(std::string("Record (second): ") + err);
+            }
+            D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+            b.Transition = {sout[k].res, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            scl->ResourceBarrier(1, &b);
+            D3D12_TEXTURE_COPY_LOCATION dst{srb[k], D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            dst.PlacedFootprint = {0, {DXGI_FORMAT_R16G16B16A16_FLOAT, ssize[k][2], ssize[k][3], 1, ssize[k][2] * 8}};
+            D3D12_TEXTURE_COPY_LOCATION src{sout[k].res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            scl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            scl->ResourceBarrier(1, &b);
+            hr_check(scl->Close(), "list (second)");
+            OnrRrInfo sa{sizeof sa};
+            api.GetInfo(sc, &sa);
+            sr = {sc, si.frames, sa.frames, k, s_cycle};
+            return true;
+        };
+        // after the second's list was submitted: destroyed with it in flight once a cycle has its network frames
+        auto churn_second = [&](const SecondRec& sr) {
+            if (!churn || sr.after < churn) return;
+            api.Destroy(sr.ctx);
+            s_ctx = nullptr;
+            s_made = false;
+            const int k = ++s_cycle & 1;
+            // ONR_VALIDATE_SECOND_GAP=ms: made again that much later (the main feature alone meanwhile: row flags)
+            const int gap = getenv("ONR_VALIDATE_SECOND_GAP") ? atoi(getenv("ONR_VALIDATE_SECOND_GAP")) : 0;
+            s_maker = std::thread([&, k, gap] {
+                if (gap > 0) Sleep(DWORD(gap));
+                s_ctx = make_second(k);
+                s_made = true;
+            });
+        };
+        auto hash16 = [](const uint16_t* m, size_t n) {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < n; ++i) h = (h ^ m[i]) * 1099511628211ull;
+            return h;
+        };
+        auto finish_second = [&](const SecondRec& sr) {
+            wait_second();
+            if (sr.after <= sr.before) return;
+            ++s_net;
+            uint16_t* m = nullptr;
+            srb[sr.k]->Map(0, nullptr, reinterpret_cast<void**>(&m));
+            const size_t n = size_t(ssize[sr.k][2]) * ssize[sr.k][3] * 4;
+            const uint64_t h = hash16(m, n);
+            if (const char* dp = getenv("ONR_VALIDATE_SECOND_DUMP")) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s_c%d_%04u.raw", dp, sr.cycle, sr.before);
+                if (FILE* df = fopen(fn, "wb")) fwrite(m, 2, n, df), fclose(df);
+            }
+            srb[sr.k]->Unmap(0, nullptr);
+            if (slog) fprintf(slog, "cycle %d %ux%u frame %u %016llx\n", sr.cycle, ssize[sr.k][2], ssize[sr.k][3], sr.before, (unsigned long long)h);
+        };
+        uint32_t main_logged = 0;
         auto run_frame = [&](int f, bool upload_guides = true) {
             // guides into the textures
             al[0]->Reset();
@@ -567,6 +752,13 @@ int wmain(int argc, wchar_t** argv) {
                     api.GetLastError(err, sizeof err);
                     throw std::runtime_error(std::string("Record: ") + err);
                 }
+                // the second feature made while the main one's frame is recorded and not yet submitted
+                if (second_on && !s_started && f == second_at) {
+                    s_started = true;
+                    s_ctx = make_second(0);
+                    if (!s_ctx.load()) throw std::runtime_error("Create (second) failed");
+                    printf("second feature made at frame %d, between the main one's Record and its submit\n", f);
+                }
                 cl[0]->EndQuery(ph, D3D12_QUERY_TYPE_TIMESTAMP, 1);
                 cl[0]->Close();
                 al[1]->Reset();
@@ -582,10 +774,18 @@ int wmain(int argc, wchar_t** argv) {
                 cl[1]->EndQuery(ph, D3D12_QUERY_TYPE_TIMESTAMP, 3);
                 cl[1]->ResolveQueryData(ph, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, prb, 0);
                 readback_output();
+                SecondRec sr{};
+                const bool s_rec = second_on && record_second(sr);
                 ID3D12CommandList* first = cl[0];
-                q->ExecuteCommandLists(1, &first);
-                if (job && sharpen > 0 && !half) {
-                    // the image read back, sharpened here, written back: an edit that follows the jitter as an NR does
+                if (!solo) q->ExecuteCommandLists(1, &first);
+                if (s_rec) {
+                    ID3D12CommandList* sl = scl;
+                    q2->ExecuteCommandLists(1, &sl);
+                    churn_second(sr);
+                }
+                if (solo) {
+                } else if (job && (sharpen > 0 || hop_dump || edit_files) && !half) {
+                    // the image read back, edited here, written back: an edit that follows the jitter as an NR does
                     wait_gpu();
                     auto* buf = static_cast<ID3D12Resource*>(im.buffer);
                     const UINT64 bytes = UINT64(im.row_pitch) * im.height;
@@ -608,10 +808,33 @@ int wmain(int argc, wchar_t** argv) {
                     eup->Map(0, nullptr, reinterpret_cast<void**>(&dst));
                     const int W = int(im.width), H = int(im.height);
                     auto px = [&](int x, int y) { return reinterpret_cast<const float*>(src + UINT64(std::clamp(y, 0, H - 1)) * im.row_pitch) + 4 * std::clamp(x, 0, W - 1); };
+                    if (hop_dump) {
+                        char fn[512];
+                        snprintf(fn, sizeof fn, "%s%04d.raw", hop_dump, f);
+                        if (FILE* df = fopen(fn, "wb")) {
+                            for (int y = 0; y < H; ++y) fwrite(src + UINT64(y) * im.row_pitch, 16, size_t(W), df);
+                            fclose(df);
+                        }
+                    }
+                    std::vector<uint16_t> given;
+                    if (edit_files) {
+                        char fn[512];
+                        snprintf(fn, sizeof fn, "%s%04d.raw", edit_files, f);
+                        FILE* ef = fopen(fn, "rb");
+                        if (!ef) throw std::runtime_error(std::string("no edit file ") + fn);
+                        given.resize(size_t(W) * H * 4);
+                        const size_t got = fread(given.data(), 2, given.size(), ef);
+                        fclose(ef);
+                        if (got != given.size()) throw std::runtime_error(std::string("short edit file ") + fn);
+                    }
                     for (int y = 0; y < H; ++y) {
                         float* o = reinterpret_cast<float*>(dst + UINT64(y) * im.row_pitch);
                         for (int x = 0; x < W; ++x)
                             for (int c = 0; c < 4; ++c) {
+                                if (edit_files) {
+                                    o[4 * x + c] = h2f(given[(size_t(y) * W + x) * 4 + c]);
+                                    continue;
+                                }
                                 float s = 0;
                                 for (int dy = -1; dy <= 1; ++dy)
                                     for (int dx = -1; dx <= 1; ++dx) s += px(x + dx, y + dy)[c];
@@ -627,10 +850,18 @@ int wmain(int argc, wchar_t** argv) {
                     q->ExecuteCommandLists(1, &h);
                 }
                 ID3D12CommandList* second = cl[1];
-                q->ExecuteCommandLists(1, &second);
+                if (!solo) q->ExecuteCommandLists(1, &second);
                 wait_gpu();
+                if (s_rec) finish_second(sr);
                 OnrRrInfo fi{sizeof fi};
                 api.GetInfo(ctx, &fi);
+                if (mlog && !solo && fi.frames > main_logged) {
+                    main_logged = fi.frames;
+                    uint16_t* m = nullptr;
+                    rb->Map(0, nullptr, reinterpret_cast<void**>(&m));
+                    fprintf(mlog, "frame %u %016llx\n", fi.frames, (unsigned long long)hash16(m, size_t(opitch) * OH / 2));
+                    rb->Unmap(0, nullptr);
+                }
                 UINT64 g = 0, cpu = 0;
                 q->GetClockCalibration(&g, &cpu);
                 uint64_t* ts = nullptr;
@@ -857,6 +1088,13 @@ int wmain(int argc, wchar_t** argv) {
         }
         upload->Unmap(0, nullptr);
         if (idle) api.Destroy(idle);
+        if (second_on) {
+            if (s_maker.joinable()) s_maker.join();
+            if (void* sc = s_ctx.load()) api.Destroy(sc);
+            printf("second feature: %u network frames over %d cycles%s\n", s_net, s_cycle + 1, solo ? " (main lists not run)" : "");
+        }
+        if (slog) fclose(slog);
+        if (mlog) fclose(mlog);
         api.Destroy(ctx);
         return bad ? 1 : 0;
     } catch (const std::exception& e) {
