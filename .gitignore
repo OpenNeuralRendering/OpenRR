@@ -1,0 +1,33 @@
+# NVIDIA SDKs and third-party sources (fetched by tools/fetch_deps.ps1, never committed)
+third_party/
+
+# NVIDIA binaries, weights, dumps and captures: never in git
+*.dll
+*.exe
+*.pdb
+*.lib
+*.bin
+*.raw
+*.cubin
+*.ptx
+*.fatbin
+captures/
+dumps/
+scenes_out/
+out/
+
+# Build
+build/
+capture/build/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tooling
+.claude/
+snippets/
+
+# Derived arrays from analysis runs
+*.npy
+*.npz
