@@ -9,6 +9,8 @@ Version 0.1.0. MIT licence.
 
 Discord: <https://discord.gg/wYhvS3JSHM>
 
+Ko-fi: <https://ko-fi.com/T6T213OVFE>
+
 ## Requirements
 
 - An RX 9000 card (RDNA4). Other cards are not supported yet.
@@ -29,6 +31,9 @@ In game, OpenRR settings are in OptiScaler's `[OpenNR-RR]` section and in the up
 - **D3D12 games**: the kernels run on the game's own device and are recorded into the game's command list.
 - **Vulkan games**: the kernels run on the game's `VkDevice` and are recorded into its command buffer.
 - The network is built on a background thread at startup. Until it is ready, frames pass through scaled.
+- **NR**: in D3D12 games, mochizuki's DLSS 5 NR can run on the denoised image; its change is kept in a history of its
+  own and added to the displayed image, so the network's own history stays clean. In Vulkan games NR on OpenRR doesn't
+  run yet.
 
 Measured on an RX 9070 XT at 1080p output: about 3.5 ms per frame at Quality and about 7 ms at DLAA. The output
 matches NVIDIA's own (captured on an RTX card) at about 60 to 65 dB PSNR.
