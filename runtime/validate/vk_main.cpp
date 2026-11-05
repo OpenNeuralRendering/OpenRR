@@ -359,7 +359,11 @@ int wmain(int argc, wchar_t** argv) {
         }
         uint32_t backend = 0;
         a5.v4.GetBackend(ctx, &backend);
-        printf("render %ux%u -> %ux%u, %d frames, fast, backend %s, guides %s, depth %s\n", RW, RH, OW, OH, nframes,
+        // ONR_VALIDATE_FAST=1: the runtime's fast mode from the start; ONR_VALIDATE_FAST_FLIP=n: flipped every n frames
+        auto set_fast = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFastMode"));
+        const int fast_flip = getenv("ONR_VALIDATE_FAST_FLIP") ? atoi(getenv("ONR_VALIDATE_FAST_FLIP")) : 0;
+        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, 1);
+        printf("render %ux%u -> %ux%u, %d frames, _f, backend %s, guides %s, depth %s\n", RW, RH, OW, OH, nframes,
                backend == ONR_RR_BACKEND_VULKAN_HOST ? "Vulkan host" : "other", general ? "GENERAL" : "SHADER_READ_ONLY_OPTIMAL",
                depth_kind == 2 ? "D32_SFLOAT_S8_UINT" : depth_kind ? "D32_SFLOAT" : "R32_SFLOAT");
         if (backend != ONR_RR_BACKEND_VULKAN_HOST) throw std::runtime_error("not the Vulkan host backend");
@@ -565,6 +569,7 @@ int wmain(int argc, wchar_t** argv) {
         int bad = 0;
         double lo = 1e9, hi = 0;
         for (int f = 0; f < nframes; ++f) {
+            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? 1 : 0);
             if (f) run_frame(f, true);
             api.GetInfo(ctx, &info);
             const uint16_t* m = static_cast<const uint16_t*>(rb.map);

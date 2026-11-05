@@ -183,9 +183,46 @@ std::vector<uint16_t> with_tiles(const std::vector<uint16_t>& v, size_t K) {
     return d;
 }
 
-Buffer Engine::upload_qv(const H16& v) {
+// S_h = Q_h Q_h^T + bias depends on in_a only through A^T A, so rotating the rows of A_h changes no score. Rows made
+// orthogonal (Hestenes) and sorted by falling norm: at C = 32 the 16 strongest hold 98.6-99.8% of the energy, and the fast
+// mode's kernels (LT_Q16) use only those
+static H16 lr_keys(const H16& a, int C, int X) {
+    H16 o(a.size());
+    for (int h = 0; h < X / 32; ++h) {
+        double m[32][32];
+        for (int r = 0; r < 32; ++r)
+            for (int c = 0; c < 32; ++c) m[r][c] = h2f(a[size_t(h) * 32 * C + r * C + c]);
+        for (int sweep = 0; sweep < 40; ++sweep) {
+            bool any = false;
+            for (int p = 0; p < 32; ++p)
+                for (int q = p + 1; q < 32; ++q) {
+                    double aa = 0, bb = 0, ab = 0;
+                    for (int i = 0; i < 32; ++i) aa += m[p][i] * m[p][i], bb += m[q][i] * m[q][i], ab += m[p][i] * m[q][i];
+                    if (ab == 0 || std::fabs(ab) <= 1e-13 * std::sqrt(aa * bb)) continue;
+                    any = true;
+                    double z = (bb - aa) / (2 * ab), t = (z >= 0 ? 1 : -1) / (std::fabs(z) + std::sqrt(1 + z * z)), co = 1 / std::sqrt(1 + t * t), si = co * t;
+                    for (int i = 0; i < 32; ++i) { double x = m[p][i], y = m[q][i]; m[p][i] = co * x - si * y, m[q][i] = si * x + co * y; }
+                }
+            if (!any) break;
+        }
+        int ord[32];
+        double nrm[32];
+        for (int r = 0; r < 32; ++r) {
+            ord[r] = r, nrm[r] = 0;
+            for (int i = 0; i < 32; ++i) nrm[r] += m[r][i] * m[r][i];
+        }
+        std::stable_sort(ord, ord + 32, [&](int x, int y) { return nrm[x] > nrm[y]; });
+        for (int r = 0; r < 32; ++r)
+            for (int c = 0; c < 32; ++c) o[size_t(h) * 32 * C + r * C + c] = f2h(float(m[ord[r]][c]));
+    }
+    return o;
+}
+
+Buffer Engine::upload_qv(const H16& v, const H16& lr) {
     if (v.empty()) return {};
     auto d = qv_bytes(v.data(), v.size());
+    d.resize(v.size() * 3 + lr.size() * 2);   // LT_Q16 reads lr at 3 n bytes; the regular kernels never do
+    std::memcpy(d.data() + v.size() * 3, lr.data(), lr.size() * 2);
     Buffer b = dev_->create(d.size());
     dev_->upload(b, d.data(), d.size());
     fixed_.push_back(b);
@@ -193,7 +230,7 @@ Buffer Engine::upload_qv(const H16& v) {
 }
 
 void Engine::upload_stage(const StageWeights& s, StageBufs& b) {
-    b.in_a = upload_qv(s.b.in_a), b.in_b = upload_qv(s.b.in_b), b.out = upload(with_tiles(s.b.out, s.b.X)), b.out_b = upload(s.b.out_b);
+    b.in_a = upload_qv(s.b.in_a, s.b.C == 32 ? lr_keys(s.b.in_a, s.b.C, s.b.X) : H16{}), b.in_b = upload_qv(s.b.in_b, {}), b.out = upload(with_tiles(s.b.out, s.b.X)), b.out_b = upload(s.b.out_b);
     b.fc1 = upload(with_tiles(s.b.fc1, s.b.C)), b.fc1_b = upload(s.b.fc1_b), b.fc2 = upload(with_tiles(s.b.fc2, 4 * s.b.C)), b.fc2_b = upload(s.b.fc2_b);
     b.bias = upload(s.b.bias), b.dfn_w = upload(s.dfn_w), b.dfn_b = upload(s.dfn_b), b.mrg_w = upload(s.Co && s.mrg_w.size() == size_t(s.Co) * 4 * s.b.C ? with_tiles(s.mrg_w, 4 * s.b.C) : s.mrg_w);
     b.mrg_b = upload(s.mrg_b), b.up_w = upload(s.up_w), b.up_b = upload(s.up_b);
@@ -323,6 +360,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
     const bool reset = f.reset || fresh_;
     const int cur = int(frame_ & 1), old = cur ^ 1;
     const bool odd = (frame_ & 1) != 0;
+    frame_lite_ = lite_on_ && lk_ && fast_;
     const I2 sh_enc = odd ? I2{6, 2} : I2{2, 6}, sh_a = odd ? I2{0, 4} : I2{4, 0}, sh_b = odd ? I2{4, 0} : I2{0, 4};
     if (fresh_) {
         memcpy(prev_w2v_, f.world_to_view, sizeof prev_w2v_);
@@ -349,7 +387,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
     if (flow) d.fill(flow_, 0, 10 * 512 * 4, 0);
 
     // launches 0 and 1: DownsampledHistory2 and the exposure (one dispatch; its last block leaves acc_ at +0)
-    if (!fresh_) K.pooled_history2(d, PooledHistory2PC{down_[old].addr, pdst_.addr, ds_, ds2_});
+    if (!fresh_) (frame_lite_ && lk_->has("pooled_history2") ? *lk_ : K).pooled_history2(d, PooledHistory2PC{down_[old].addr, pdst_.addr, ds_, ds2_});
     AePC ae{dg ? gtab_.addr : g.color, acc_.addr, f.render, {0, 0}, {f.render.x - 1, f.render.y - 1}, expo_[cur].addr, expo_[old].addr, blk_.addr,
             float(1.0 / (429496.71875 * double(f.render.x) * double(f.render.y))), reset ? 1u : 0u,
             uint32_t(div_up(f.render.x, 16) * div_up(f.render.y, 16))};
@@ -386,7 +424,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
             attr_k += "_w";
         }
     }
-    K.run(d, attr_k, &a, sizeof a, div_up(uint32_t(pad_.x * pad_.y), 64));
+    run(d, attr_k, &a, sizeof a, div_up(uint32_t(pad_.x * pad_.y), 64));
     d.barrier();
     {
         const StageWeights& s = W.enc[0];
@@ -395,7 +433,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
         e.s = EncStagePC{block_pc(s, b, 0, enc_l_[0].tensor.addr, pad_, sh_enc), b.dfn_w.addr, b.dfn_b.addr, embed_w_.addr, embed_b_.addr,
                          img_.addr, enc_l_[0].dfn.addr, enc_l_[0].dfn_pool.addr, 0, s.s_dfn, I2{}};
         e.attr = wide ? attr_wide_.addr : attr_.addr, e.lut = lut_.addr, e.frame8 = uint32_t(frame_ % 8), e.img_h = f.render.y, e.img_w = f.render.x;
-        K.run(d, "enc0_stage_32_64" + fx + (wide ? "_w" : ""), &e, sizeof e, windows(e.s.b));
+        run(d, "enc0_stage_32_64" + fx + (wide ? "_w" : ""), &e, sizeof e, windows(e.s.b));
         d.barrier();
     }
     // enc1..enc5
@@ -409,7 +447,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
                      sw.s_dfn, s == 1 ? pad_ : I2{}};
         const bool fl = flow && s >= 2;
         if (fl) p.b.mask = flow_.addr;
-        K.run(d, "enc_stage_" + dims(sw.b) + "_" + std::to_string(sw.Co) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
+        run(d, "enc_stage_" + dims(sw.b) + "_" + std::to_string(sw.Co) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
         if (!fl) d.barrier();
     }
     // dec4..dec0
@@ -424,7 +462,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
         if (!l && lh < z.y) u.live_h = lh;
         const bool fl = flow && l >= 2;
         if (fl) u.b.mask = flow_.addr;
-        K.run(d, "dec_up_" + dims(s0.b) + "_" + std::to_string(s0.Cp) + (fl ? "_fl" : fx), &u, sizeof u, windows(u.b));
+        run(d, "dec_up_" + dims(s0.b) + "_" + std::to_string(s0.Cp) + (fl ? "_fl" : fx), &u, sizeof u, windows(u.b));
         if (!fl) d.barrier();
         DecDfnPC p{};
         p.b = block_pc(s1, dec1_[l], dec0_l_[l].tensor.addr, l ? dec1_l_[l].tensor.addr : 0, z, sh_b);
@@ -442,14 +480,14 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
             if (fast_ && p.tile && !dfn_out) p.dfn_out = 0;
         }
         if (fl) p.b.mask = flow_.addr;
-        K.run(d, (l ? "dec_dfn_" : "dec_head_") + dims(s1.b) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
+        run(d, (l ? "dec_dfn_" : "dec_head_") + dims(s1.b) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
         // dec2_1 ends the flow: everything after it reads behind a barrier
         if (!(fl && l >= 3)) d.barrier();
         bt = dec1_l_[l].tensor.addr, bd = dec1_l_[l].dfn.addr;
     }
     if (dfn_out) {
         DfnExportPC e{dec1_l_[0].dfn.addr, blk_.addr, dfn_out, f.render, pad_.x, dfn_pitch, dfn_half ? 1u : 0u};
-        d.dispatch(K["dfn_export"], &e, sizeof e, div_up(f.render.x, 16), div_up(f.render.y, 16));
+        d.dispatch((frame_lite_ && lk_->has("dfn_export") ? *lk_ : K)["dfn_export"], &e, sizeof e, div_up(f.render.x, 16), div_up(f.render.y, 16));
     }
 }
 
@@ -464,7 +502,7 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
     // halves, after the tile (the head's or post_tile's)
     DfnImportPC im{in.src, blk_.addr, dec1_l_[0].dfn.addr, tile_.addr, f.render, pad_.x, in.pitch, in.fmt, edit == DfnEdit::display ? 1u : 0u};
     auto import = [&] {
-        d.dispatch(K["dfn_import"], &im, sizeof im, div_up(f.render.x, 16), div_up(f.render.y, 16));
+        d.dispatch((frame_lite_ && lk_->has("dfn_import") ? *lk_ : K)["dfn_import"], &im, sizeof im, div_up(f.render.x, 16), div_up(f.render.y, 16));
         d.barrier();
     };
     if (edit == DfnEdit::loop) import();
@@ -499,10 +537,10 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
         PostDltPC pn{pp, dh_[old].addr, dh_[cur].addr, dh_alpha_};
         if (nr_frame_ == ~0ull || nr_frame_ + 1 != frame_) pn.p.reset |= 4u;
         if (edit == DfnEdit::none) pn.p.reset |= 8u;
-        K.post_dlt(d, pn, fix_, fast_);
+        (frame_lite_ && lk_->has("post_dlt_f") ? *lk_ : K).post_dlt(d, pn, fix_, fast_);
         nr_frame_ = frame_;
     } else {
-        K.post(d, pp, fix_, fast_);
+        (frame_lite_ && lk_->has("post_f") ? *lk_ : K).post(d, pp, fix_, fast_);
     }
     d.barrier();
     const DownsamplePC ds{frg_.addr, fb_.addr, out, blk_.addr, internal_, f.output, {0, 0}, f.output, internal_, {0, internal_.x}};
@@ -530,11 +568,12 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
             p.op = f.transparency_opacity, p.op_hist_in = toh_[old].addr, p.op_hist_out = toh_[cur].addr;
             p.op_reset = p.reset || !to_last_ ? 1u : 0u;
         }
-        d.dispatch(K[img ? "d3d_downsample_tl" : "downsample_tl"], &p, sizeof p, div_up(f.output.x, 16), div_up(f.output.y, 16));
+        const std::string tlk = img ? "d3d_downsample_tl" : "downsample_tl";
+        d.dispatch((frame_lite_ && lk_->has(tlk) ? *lk_ : K)[tlk], &p, sizeof p, div_up(f.output.x, 16), div_up(f.output.y, 16));
     } else if (img) {
-        d.dispatch(K["d3d_downsample"], &ds, sizeof ds, div_up(f.output.x, 16), div_up(f.output.y, 16));
+        d.dispatch((frame_lite_ && lk_->has("d3d_downsample") ? *lk_ : K)["d3d_downsample"], &ds, sizeof ds, div_up(f.output.x, 16), div_up(f.output.y, 16));
     } else {
-        K.downsample(d, ds);
+        (frame_lite_ && lk_->has("downsample") ? *lk_ : K).downsample(d, ds);
     }
     tl_last_ = f.transparency != 0;
     to_last_ = tl_last_ && f.transparency_opacity != 0;

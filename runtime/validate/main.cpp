@@ -301,6 +301,9 @@ int wmain(int argc, wchar_t** argv) {
             api.GetLastError(err, sizeof err);
             throw std::runtime_error(std::string("Create: ") + err);
         }
+        auto set_fast = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFastMode"));
+        auto get_fast = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFastMode"));
+        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, 1);
         // ONR_VALIDATE_IDLE=1: a second context that never records, so two networks live in the process
         void* idle = nullptr;
         if (getenv("ONR_VALIDATE_IDLE")) {
@@ -971,11 +974,28 @@ int wmain(int argc, wchar_t** argv) {
         }
         printf("network ready after %.1f s (weights: %s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                info.weights_source);
+        // ONR_VALIDATE_FAST=1: the runtime's fast mode (OnrRrSetFastMode) from the start, built with the network;
+        // ONR_VALIDATE_FAST_FLIP=n: and flipped every n frames. ONR_VALIDATE_FAST_AT=n: asked at frame n, and it waits there for
+        // the kernels (frame n itself still runs on the others if they are not built)
+        const int fast_flip = getenv("ONR_VALIDATE_FAST_FLIP") ? atoi(getenv("ONR_VALIDATE_FAST_FLIP")) : 0;
+        const int fast_at = getenv("ONR_VALIDATE_FAST_AT") ? atoi(getenv("ONR_VALIDATE_FAST_AT")) : -1;
+        auto fast_sync = [&](int f) {
+            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? 1 : 0);
+            if (f == fast_at && set_fast) {
+                set_fast(ctx, 1);
+            }
+        };
         printf("frame  PSNR dB  equal %%   GPU ms (ingest + network + pack)  output hash\n");
         int bad = 0;
         double lo = 1e9, hi = 0;
         for (int f = 0; f < nframes; ++f) {
+            fast_sync(f);
+            const auto fast_t0 = std::chrono::steady_clock::now();
             if (f) run_frame(f);
+            if (f == fast_at && get_fast) {
+                while (get_fast(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                printf("fast mode ready %.2f s after it was asked for (state %d)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - fast_t0).count(), get_fast(ctx));
+            }
             api.GetInfo(ctx, &info);
             uint16_t* m = nullptr;
             rb->Map(0, nullptr, reinterpret_cast<void**>(&m));
@@ -1027,7 +1047,24 @@ int wmain(int argc, wchar_t** argv) {
         // ONR_VALIDATE_LOOP=n: the last frame n more times without new guides, for the GPU time at a steady clock (the
         // runtime log splits it into ingest, network and pack every 600 frames)
         if (const char* lp = getenv("ONR_VALIDATE_LOOP")) {
-            for (int i = 0, n = atoi(lp); i < n; ++i) run_frame(nframes - 1, false);
+            // ONR_VALIDATE_LOOP_CYCLE=1: through the scene's frames over and over instead; ONR_VALIDATE_LOOP_DUMP=<prefix>,<every>:
+            // the output every so many loop frames, to look for drift
+            const bool cycle = getenv("ONR_VALIDATE_LOOP_CYCLE") != nullptr;
+            const char* ld = getenv("ONR_VALIDATE_LOOP_DUMP");
+            const char* ldc = ld ? strrchr(ld, ',') : nullptr;
+            const int ldn = ldc ? atoi(ldc + 1) : 0;
+            for (int i = 0, n = atoi(lp); i < n; ++i) {
+                if (cycle) run_frame(i % nframes);
+                else run_frame(nframes - 1, false);
+                if (ldn && (i + 1) % ldn == 0) {
+                    char fn[512];
+                    snprintf(fn, sizeof fn, "%.*sL%05d.raw", int(ldc - ld), ld, i + 1);
+                    uint16_t* m = nullptr;
+                    rb->Map(0, nullptr, reinterpret_cast<void**>(&m));
+                    if (FILE* df = fopen(fn, "wb")) fwrite(m, 1, size_t(opitch) * OH, df), fclose(df);
+                    rb->Unmap(0, nullptr);
+                }
+            }
             api.GetInfo(ctx, &info);
             printf("loop of %s frames: GPU %.2f ms (average of the last 64: %.2f ms)\n", lp, info.gpu_ms_last, info.gpu_ms_average);
             // the hops the runtime still keeps (its last 16, less the ones whose submits it has not read back yet)
