@@ -66,7 +66,7 @@ extern "C" {
 #define ONR_RR_ABI_VERSION_4 4
 #define ONR_RR_ABI_VERSION_5 5
 
-#define ONR_RR_RUNTIME_VERSION "0.1.0"
+#define ONR_RR_RUNTIME_VERSION "0.1.1"
 #define ONR_RR_RUNTIME_VERSION_RC 0, 1, 0, 0
 
 enum OnrRrResult {
