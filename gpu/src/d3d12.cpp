@@ -243,13 +243,14 @@ bool D3dDevice::init(ID3D12Device* dev, Device* compiler, const std::wstring& ca
         qrb_ = buffer(dev_, uint64_t(kSlots) * kSlotQueries * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
         // The ELFs read set 0 at the low 32 bits in its user data entry with the high bits of their own code address,
         // 32 bytes a view: the convention the driver's own descriptor tables follow, so a shader-visible heap fits.
+        // Each recording slot owns kSlotViews (18) + kTableViews (12) descriptors so its sampled-image table is
+        // snapshotted per recording and never overwritten in place by a later resize() or set_texture().
         if (dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) == 32) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * kSlotViews + kTableViews,
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * kSlotStride,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
             check(dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "CreateDescriptorHeap");
             heap_cpu_ = heap_->GetCPUDescriptorHandleForHeapStart().ptr;
             heap_gpu_ = heap_->GetGPUDescriptorHandleForHeapStart().ptr;
-            table_lo_ = uint32_t(heap_gpu_ + uint64_t(kSlots) * kSlotViews * 32);
         }
         void* m = nullptr;
         check(qrb_->Map(0, nullptr, &m), "Map");
@@ -303,7 +304,14 @@ void D3dDevice::bind(ID3D12GraphicsCommandList* cl, uint32_t slot) {
     nquery_ = 0;
     stamp_names.clear();
     ring_off_ = uint64_t(slot_) << 16, ring_end_ = ring_off_ + (1u << 16);
-    desc_lo_ = heap_ ? uint32_t(heap_gpu_ + uint64_t(slot_) * kSlotViews * 32) : 0;
+    if (heap_) {
+        const uint64_t base_desc = uint64_t(slot_) * kSlotStride * 32;
+        desc_lo_ = uint32_t(heap_gpu_ + base_desc);
+        table_lo_ = desc_lo_ + kSlotViews * 32;
+        memcpy(reinterpret_cast<uint8_t*>(heap_cpu_ + base_desc + kSlotViews * 32), tex_table_, sizeof(tex_table_));
+    } else {
+        desc_lo_ = table_lo_ = 0;
+    }
     bound_ = nullptr;
     dirty_ = false;
     cl_->SetComputeRootSignature(rs_);
@@ -567,14 +575,14 @@ void D3dDevice::srv(ID3D12Resource* r, uint32_t index, uint32_t fmt) {
     d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     d.Texture2D.MipLevels = 1;
-    dev_->CreateShaderResourceView(r, &d, {size_t(heap_cpu_ + (uint64_t(slot_) * kSlotViews + index) * 32)});
+    dev_->CreateShaderResourceView(r, &d, {size_t(heap_cpu_ + (uint64_t(slot_) * kSlotStride + index) * 32)});
 }
 
 void D3dDevice::uav(ID3D12Resource* r, uint32_t index, uint32_t fmt) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
     d.Format = DXGI_FORMAT(fmt);
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    dev_->CreateUnorderedAccessView(r, nullptr, &d, {size_t(heap_cpu_ + (uint64_t(slot_) * kSlotViews + index) * 32)});
+    dev_->CreateUnorderedAccessView(r, nullptr, &d, {size_t(heap_cpu_ + (uint64_t(slot_) * kSlotStride + index) * 32)});
 }
 
 // The descriptor of a linear w x h image at address a: from the Vulkan device of its own, over a buffer of its own.
@@ -605,18 +613,23 @@ bool D3dDevice::init_sampler(std::string& why) {
     if (!VirtualQuery(reinterpret_cast<void*>(heap_cpu_), &mi, sizeof mi) || mi.State != MEM_COMMIT ||
         !(mi.Protect & (PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_NOCACHE)))
         return why = "the descriptor heap is not CPU-writable memory", false;
-    srd_ = std::make_unique<Device>();
-    LUID luid = dev_->GetAdapterLuid();
-    DeviceOptions o;
-    o.luid = reinterpret_cast<const uint8_t*>(&luid);
-    o.descriptors = true;
-    std::string err;
-    if (!srd_->init(err, o)) return srd_.reset(), why = "Vulkan descriptor device: " + err, false;
+    Device* desc_dev = (compiler_ && compiler_->has_descriptors()) ? compiler_ : nullptr;
+    if (!desc_dev) {
+        srd_ = std::make_unique<Device>();
+        LUID luid = dev_->GetAdapterLuid();
+        DeviceOptions o;
+        o.luid = reinterpret_cast<const uint8_t*>(&luid);
+        o.descriptors = true;
+        std::string err;
+        if (!srd_->init(err, o) || !srd_->has_descriptors())
+            return srd_.reset(), why = "Vulkan descriptor device: " + (err.empty() ? "lacks VK_EXT_descriptor_buffer" : err), false;
+        desc_dev = srd_.get();
+    }
     // two images at two addresses: only the base address may differ, at the bits it is expected at
     uint8_t d[2][48];
     uint64_t a[2];
     for (int i = 0; i < 2; ++i)
-        if (!linear_descriptor(*srd_, 64, 8, VK_FORMAT_R16G16B16A16_SFLOAT, 8, d[i], a[i]))
+        if (!linear_descriptor(*desc_dev, 64, 8, VK_FORMAT_R16G16B16A16_SFLOAT, 8, d[i], a[i]))
             return srd_.reset(), why = "no linear image descriptor from Vulkan", false;
     for (int i = 0; i < 2; ++i) {
         uint8_t t[48];
@@ -634,7 +647,8 @@ Image D3dDevice::alias_image(const Buffer& b, uint32_t w, uint32_t h, VkFormat f
     if (!srd_ok_) return {};
     std::array<uint8_t, 48> t;
     uint64_t a = 0;
-    if (!linear_descriptor(*srd_, w, h, fmt, bpp, t.data(), a)) return {};
+    Device* desc_dev = (compiler_ && compiler_->has_descriptors()) ? compiler_ : srd_.get();
+    if (!desc_dev || !linear_descriptor(*desc_dev, w, h, fmt, bpp, t.data(), a)) return {};
     put_address(t.data(), b.addr);
     Image im;
     im.img = reinterpret_cast<VkImage>(uintptr_t(next_image_));
@@ -657,7 +671,10 @@ void D3dDevice::set_texture(uint32_t slot, const Image& i, VkSampler s) {
     auto it = images_.find(uint64_t(reinterpret_cast<uintptr_t>(i.img)));
     if (it == images_.end() || slot >= 8 || s != reinterpret_cast<VkSampler>(uintptr_t(1)))
         throw std::runtime_error("D3dDevice::set_texture: no such image or sampler");
-    memcpy(reinterpret_cast<uint8_t*>(heap_cpu_) + uint64_t(kSlots) * kSlotViews * 32 + slot * 48, it->second.data(), 48);
+    memcpy(tex_table_[slot], it->second.data(), 48);
+    if (cl_ && heap_)
+        memcpy(reinterpret_cast<uint8_t*>(heap_cpu_ + (uint64_t(slot_) * kSlotStride + kSlotViews) * 32 + slot * 48),
+               it->second.data(), 48);
 }
 
 void D3dDevice::barrier() {

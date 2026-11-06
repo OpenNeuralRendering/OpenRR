@@ -345,6 +345,7 @@ struct Job {
     OnrRrFrame f{};
     Copy in[G_COUNT];
     std::shared_ptr<SharedBuffer> input, output, image;
+    UINT64 out_bytes = 0;
     UINT out_pitch = 0;
     Tf out_tf = TF_NONE;
     bool enqueued = false, output_recorded = false;
@@ -431,6 +432,7 @@ struct Ctx {
     bool logged_ray = false;
     GuideStats stats[2];               // disocclusion mask, SSS guide
     std::shared_ptr<std::atomic<bool>> stats_busy = std::make_shared<std::atomic<bool>>(false);   // a summing thread runs
+    std::thread stats_thread;
     uint64_t stats_seq = 0;            // the frame their copies were recorded on
     ULONGLONG stats_tick = 0;
     // D3D12 backend (ABI 4): the game's device, its own kernels and buffers; d3d says it runs the frames
@@ -515,8 +517,8 @@ void build_network(Ctx* c) {
                 g_log("network kernels ready on D3D12 (%zu pipelines: %u ELFs from the cache, %u built) in %.1f s", names.size(), c->dx->cache_hits() - h0, c->dx->cache_misses() - m0,
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             } catch (const std::exception& e) {
-                k.unload(*c->dx);
                 std::lock_guard l(c->m);
+                k.unload(*c->dx);
                 // the network never ran on D3D12 here: the frames simply go to Vulkan from now on
                 if (c->engine_ready) throw;
                 c->use_d3d = false;
@@ -566,7 +568,7 @@ void build_lite(Ctx* c) {
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         c->lite_built = true;
     } catch (const std::exception& e) {
-        c->net_lite.unload(d);
+        { std::lock_guard l(c->m); c->net_lite.unload(d); }
         c->lite_failed = true;
         g_log("fast mode not available: %s", e.what());
     }
@@ -584,17 +586,19 @@ Buffer make_buffer(Gpu& d, size_t n) {
     return b;
 }
 
-// the guides in the kernels' formats, on the device that runs the frames
+// the guides in the kernels' formats, on the device that runs the frames (preallocated up to max_render for DRS)
 void ensure_guides(Ctx* c, Gpu& d, I2 render) {
-    if (c->guides_dev == &d && c->guide_size.x == render.x && c->guide_size.y == render.y) return;
+    I2 cap{std::max({render.x, c->max_render.x, c->guide_size.x}),
+           std::max({render.y, c->max_render.y, c->guide_size.y})};
+    if (c->guides_dev == &d && cap.x <= c->guide_size.x && cap.y <= c->guide_size.y) return;
     if (c->guides_dev)
         for (auto& b : c->guides)
             if (b.addr) c->guides_dev->destroy(b);
-    size_t px = size_t(render.x) * render.y;
+    size_t px = size_t(cap.x) * cap.y;
     const size_t bpp[G_COUNT] = {8, 4, 4, 8, 2, 4, 4, 2, 0, 8, 4, 4};   // the rest: on their first frame (record_frame)
     for (int i = 0; i < G_COUNT; ++i)
-        if (bpp[i]) c->guides[i] = make_buffer(d, px * bpp[i]);
-    c->guide_size = render;
+        if (bpp[i] && !(c->use_d3d && c->direct_ok)) c->guides[i] = make_buffer(d, px * bpp[i]);
+    c->guide_size = cap;
     c->guides_dev = &d;
 }
 
@@ -669,6 +673,7 @@ struct Rec {
 };
 
 void record_pack(Ctx* c, Rec& r, Job& j) {
+    if (!c->out16.addr) c->out16 = r.d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
     r.d.barrier();
     PackPC pk{c->out16.addr, r.output, c->out_size, c->out_size, r.out_fmt ? r.out_pitch : j.out_pitch, r.out_fmt ? r.out_fmt : uint32_t(j.out_tf)};
     r.d.dispatch(r.k[r.pack], &pk, sizeof pk, div_up(c->out_size.x, 16), div_up(c->out_size.y, 16));
@@ -682,12 +687,16 @@ void record_post(Ctx* c, Rec& r, Job& j, Tf edited) {
         in = DfnImport{r.image, (j.f.render_width * tf_bytes(edited) + 255) & ~255u, uint32_t(edited)};
         edit = j.edit == ONR_RR_EDIT_DISPLAY ? DfnEdit::display : DfnEdit::loop;
     }
+    const bool img = r.out_fmt && c->engine.output_image_ok();
+    c->engine.set_output_image(img);
+    if (!img && !c->out16.addr) c->out16 = r.d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
     r.qnet[0] = r.d.queries();
     r.d.stamp();
-    c->engine.record_post(engine_frame(c, j), c->out16.addr, edit, in);
+    c->engine.record_post(engine_frame(c, j), img ? uint64_t(r.out_pitch) : c->out16.addr, edit, in);
+    c->engine.set_output_image(false);
     r.d.stamp();
     r.qnet[1] = r.d.queries();
-    record_pack(c, r, j);
+    if (!img) record_pack(c, r, j);
 }
 
 // ONR_RR_DIRECT_GUIDES=0 (measurements): the ingest writes the guides even where the network can read them itself
@@ -736,13 +745,26 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
         memcpy(gt.proj, ip.proj, sizeof gt.proj);
         gt.depth_sign = ip.depth_sign;
         ingest = false;
+        const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
         for (int s = 0; s < 8; ++s) {
             gt.buf[s] = ip.dst[s];
-            if (((ip.g[s][2] >> 16) & 12u) != 0) ip.dst[s] = 0;
-            else ingest = true;
+            if (((ip.g[s][2] >> 16) & 12u) != 0) {
+                ip.dst[s] = 0;
+            } else {
+                if (!c->guides[s].addr) c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64);
+                ip.dst[s] = gt.buf[s] = c->guides[s].addr;
+                ingest = true;
+            }
         }
     }
-    if (ingest) d.dispatch(r.k[r.ingest], &ip, sizeof ip, div_up(render.x, 16), div_up(render.y, 16));
+    if (ingest) {
+        const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
+        for (int s = 0; s < 8; ++s) {
+            if (!direct && (network || s == G_COLOR) && !c->guides[s].addr)
+                c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64), ip.dst[s] = c->guides[s].addr;
+        }
+        d.dispatch(r.k[r.ingest], &ip, sizeof ip, div_up(render.x, 16), div_up(render.y, 16));
+    }
     if (network) {
         // the optional guides the game gave, in dispatches of their own (eight slots each, the others without a
         // destination): the transparency layer, ColorBeforeTransparency and the layer's opacity as rgba16f, the
@@ -810,6 +832,7 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
         // straight into the output texture: the downsample writes it, no pack
         const bool img = r.out_fmt && c->engine.output_image_ok();
         c->engine.set_output_image(img);
+        if (!img && !c->out16.addr) c->out16 = d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
         c->engine.record(ef, g, img ? uint64_t(r.out_pitch) : c->out16.addr);
         c->engine.set_output_image(false);
         d.stamp();
@@ -965,8 +988,9 @@ bool prepare_network(Ctx* c, Gpu& d, I2 render, F&& idle) {
     if (network && (c->engine.render().x != render.x || c->engine.render().y != render.y || c->engine.output().x != c->out_size.x ||
                     c->engine.output().y != c->out_size.y)) {
         idle();
-        c->engine.resize(render, c->out_size);
-        if (!c->out16.addr) c->out16 = make_buffer(d, size_t(c->out_size.x) * c->out_size.y * 8);
+        c->engine.resize(render, c->out_size, {std::max(render.x, c->max_render.x), std::max(render.y, c->max_render.y)});
+        if (!(c->use_d3d && c->direct_ok && c->engine.output_image_ok()) && !c->out16.addr)
+            c->out16 = make_buffer(d, size_t(c->out_size.x) * c->out_size.y * 8);
         g_log("network sized: render %dx%d (grid %dx%d), output %dx%d, internal %dx%d", render.x, render.y, (render.x + 31) & ~31,
               (render.y + 31) & ~31, c->out_size.x, c->out_size.y, c->out_size.x * 3 / 2, c->out_size.y * 3 / 2);
         if (c->vk_host) log_vram(c);
@@ -1053,6 +1077,7 @@ int32_t enqueue(Ctx* c, Job& j, ID3D12CommandQueue* q, uint32_t* exported = null
 void free_ctx(Ctx* c) {
     if (c->builder.joinable()) c->builder.join();
     if (c->lite_builder.joinable()) c->lite_builder.join();
+    if (c->stats_thread.joinable()) c->stats_thread.join();
     // the game's own device is idle at Destroy (the host's contract); waiting on it would race the game's queues
     if (c->dev.vk() && !c->vk_host) vkDeviceWaitIdle(c->dev.vk());
     c->engine.destroy();
@@ -1258,6 +1283,7 @@ int32_t Create(const OnrRrCreateInfo* in, void** out) {
         DeviceOptions o;
         o.luid = reinterpret_cast<const uint8_t*>(&luid);
         o.interop = true;
+        o.descriptors = true;
         std::string err;
         if (!c->dev.init(err, o)) throw std::runtime_error("Vulkan: " + err);
         // timestamps only at the submit's boundaries: one around every dispatch serialises the ones without a barrier
@@ -1426,13 +1452,14 @@ void stats_read(Ctx* c, uint64_t seq) {
     for (int k = 0; k < 2; ++k)
         if (g[k].pending) g[k].rb->AddRef();
     c->stats[0].pending = c->stats[1].pending = false;
+    if (c->stats_thread.joinable()) c->stats_thread.join();
     c->stats_busy->store(true);
-    std::thread([g0 = g[0], g1 = g[1], seq = c->stats_seq, busy = c->stats_busy] {
+    c->stats_thread = std::thread([g0 = g[0], g1 = g[1], seq = c->stats_seq, busy = c->stats_busy] {
         const GuideStats g[2] = {g0, g1};
         for (int k = 0; k < 2; ++k)
             if (g[k].pending) stats_sum(g[k], k, seq), g[k].rb->Release();
         busy->store(false);
-    }).detach();
+    });
 }
 
 void stats_record(Ctx* c, const Job& j, ID3D12GraphicsCommandList* cl) {
@@ -1585,7 +1612,7 @@ int32_t plan_job(Ctx* c, const OnrRrFrame* f, std::unique_ptr<Job>& j, D3D12_PLA
         if (oi->width < uint32_t(c->out_size.x) || oi->height < uint32_t(c->out_size.y))
             return fail(ONR_RR_INVALID_ARGUMENT, "the output image is smaller than the output size given at Create");
         j->out_pitch = (uint32_t(c->out_size.x) * tf_bytes(j->out_tf) + 255) & ~255u;
-        obytes = UINT64(j->out_pitch) * uint32_t(c->out_size.y);
+        j->out_bytes = obytes = UINT64(j->out_pitch) * uint32_t(c->out_size.y);
         return ONR_RR_OK;
     }
     auto* outr = static_cast<ID3D12Resource*>(f->output.resource);
@@ -1598,6 +1625,7 @@ int32_t plan_job(Ctx* c, const OnrRrFrame* f, std::unique_ptr<Job>& j, D3D12_PLA
     box.Width = UINT64(c->out_size.x), box.Height = UINT(c->out_size.y);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT ofp{};
     c->d3d->GetCopyableFootprints(&box, 0, 1, 0, &ofp, nullptr, nullptr, &obytes);
+    j->out_bytes = obytes;
     j->out_pitch = ofp.Footprint.RowPitch;
     return ONR_RR_OK;
 }
@@ -2142,7 +2170,14 @@ void d3d_copy_inputs(Ctx* c, const Job& j) {
     for (int i = 0; i < G_COUNT; ++i)
         if (j.in[i].present && !j.in[i].direct)
             cp[n++] = {static_cast<ID3D12Resource*>(tex[i]->resource), tex[i]->state, j.in[i].offset, j.in[i].pitch, 0, 0};
-    if (n) c->dx->copy_textures_to_buffer(cp, n, c->dinput);
+    if (n) {
+        uint64_t end = 0;
+        for (int i = 0; i < G_COUNT; ++i)
+            if (j.in[i].present && !j.in[i].direct)
+                end = std::max<uint64_t>(end, j.in[i].offset + uint64_t(j.in[i].pitch) * j.in[i].th);
+        d3d_ensure(c, c->dinput, (end + 511) & ~uint64_t(511));
+        c->dx->copy_textures_to_buffer(cp, n, c->dinput);
+    }
 }
 
 // d3d_pack straight into the output: an rgba16f texture that takes a UAV (the store keeps the bits); r set up, the
@@ -2201,8 +2236,8 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
         const bool was_ready = c->state == ONR_RR_STATE_READY;
         // our buffers outlive the lists that use them by D3dDevice's deferred release, so nothing waits here
         const bool network = prepare_network(c, d, render, [] {});
-        d3d_ensure(c, c->dinput, in_bytes);
-        d3d_ensure(c, c->doutput, out_bytes);
+        // dinput and doutput are allocated on demand below only when a texture is not read/written directly.
+        (void)out_bytes;
         const bool hop = network && was_ready && image && (edit == ONR_RR_EDIT_LOOP || edit == ONR_RR_EDIT_DISPLAY);
         if (hop) {
             j->edit = edit;
@@ -2228,7 +2263,12 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
                 d3d_plan_direct(c, *j, back);
             }
             d3d_copy_inputs(c, *j);
+            r.input = c->dinput.addr;
             const bool direct_out = !hop && d3d_direct_output(c, *j, r, back);
+            if (!direct_out && !hop) {
+                d3d_ensure(c, c->doutput, out_bytes);
+                r.output = c->doutput.addr;
+            }
             record_frame(c, r, *j, network, hop);
             if (!hop) {
                 if (direct_out) d.barrier();
@@ -2292,6 +2332,10 @@ int32_t RecordPost(void* ctx, void* job, void* list, uint32_t format) {
             d.stamp();
             if (c->direct_ok) r.pack = "d3d_pack";
             const bool direct_out = d3d_direct_output(c, j, r, back);
+            if (!direct_out) {
+                d3d_ensure(c, c->doutput, j.out_bytes);
+                r.output = c->doutput.addr;
+            }
             record_post(c, r, j, tf);
             if (direct_out) d.barrier();
             else d3d_copy_output(c, j);

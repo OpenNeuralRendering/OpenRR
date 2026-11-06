@@ -145,12 +145,31 @@ Buffer Engine::make(size_t bytes) {
     return b;
 }
 
+namespace {
+thread_local std::vector<uint8_t>* t_pack_blob = nullptr;
+thread_local std::vector<Buffer*>* t_pack_refs = nullptr;
+
+Buffer pack_bytes(Gpu* dev, std::vector<Buffer>& fixed, const void* data, size_t bytes, Buffer* slot = nullptr) {
+    if (!bytes) return {};
+    if (t_pack_blob && slot) {
+        const size_t off = (t_pack_blob->size() + 255) & ~size_t(255);
+        t_pack_blob->resize(off + bytes, 0);
+        std::memcpy(t_pack_blob->data() + off, data, bytes);
+        slot->addr = off;
+        slot->size = bytes;
+        t_pack_refs->push_back(slot);
+        return *slot;
+    }
+    Buffer b = dev->create(bytes);
+    dev->upload(b, data, bytes);
+    fixed.push_back(b);
+    return b;
+}
+}  // namespace
+
 Buffer Engine::upload(const H16& v) {
     if (v.empty()) return {};
-    Buffer b = dev_->create(v.size() * 2);
-    dev_->upload(b, v.data(), v.size() * 2);
-    fixed_.push_back(b);
-    return b;
+    return pack_bytes(dev_, fixed_, v.data(), v.size() * 2);
 }
 
 // in_a / in_b: the fp16 weights, then the same values as OCP e4m3 codes (they are exact e4m3) for the FP8 Q/V
@@ -223,31 +242,62 @@ Buffer Engine::upload_qv(const H16& v, const H16& lr) {
     auto d = qv_bytes(v.data(), v.size());
     d.resize(v.size() * 3 + lr.size() * 2);   // LT_Q16 reads lr at 3 n bytes; the regular kernels never do
     std::memcpy(d.data() + v.size() * 3, lr.data(), lr.size() * 2);
-    Buffer b = dev_->create(d.size());
-    dev_->upload(b, d.data(), d.size());
-    fixed_.push_back(b);
-    return b;
+    return pack_bytes(dev_, fixed_, d.data(), d.size());
 }
 
 void Engine::upload_stage(const StageWeights& s, StageBufs& b) {
-    b.in_a = upload_qv(s.b.in_a, s.b.C == 32 ? lr_keys(s.b.in_a, s.b.C, s.b.X) : H16{}), b.in_b = upload_qv(s.b.in_b, {}), b.out = upload(with_tiles(s.b.out, s.b.X)), b.out_b = upload(s.b.out_b);
-    b.fc1 = upload(with_tiles(s.b.fc1, s.b.C)), b.fc1_b = upload(s.b.fc1_b), b.fc2 = upload(with_tiles(s.b.fc2, 4 * s.b.C)), b.fc2_b = upload(s.b.fc2_b);
-    b.bias = upload(s.b.bias), b.dfn_w = upload(s.dfn_w), b.dfn_b = upload(s.dfn_b), b.mrg_w = upload(s.Co && s.mrg_w.size() == size_t(s.Co) * 4 * s.b.C ? with_tiles(s.mrg_w, 4 * s.b.C) : s.mrg_w);
-    b.mrg_b = upload(s.mrg_b), b.up_w = upload(s.up_w), b.up_b = upload(s.up_b);
+    auto U = [&](Buffer& dst, const H16& v) { if (!v.empty()) pack_bytes(dev_, fixed_, v.data(), v.size() * 2, &dst); else dst = {}; };
+    auto UQ = [&](Buffer& dst, const H16& v, const H16& lr) {
+        if (v.empty()) { dst = {}; return; }
+        auto d = qv_bytes(v.data(), v.size());
+        d.resize(v.size() * 3 + lr.size() * 2);
+        std::memcpy(d.data() + v.size() * 3, lr.data(), lr.size() * 2);
+        pack_bytes(dev_, fixed_, d.data(), d.size(), &dst);
+    };
+    UQ(b.in_a, s.b.in_a, s.b.C == 32 ? lr_keys(s.b.in_a, s.b.C, s.b.X) : H16{});
+    UQ(b.in_b, s.b.in_b, {});
+    U(b.out, with_tiles(s.b.out, s.b.X));
+    U(b.out_b, s.b.out_b);
+    U(b.fc1, with_tiles(s.b.fc1, s.b.C));
+    U(b.fc1_b, s.b.fc1_b);
+    U(b.fc2, with_tiles(s.b.fc2, 4 * s.b.C));
+    U(b.fc2_b, s.b.fc2_b);
+    U(b.bias, s.b.bias);
+    U(b.dfn_w, s.dfn_w);
+    U(b.dfn_b, s.dfn_b);
+    U(b.mrg_w, s.Co && s.mrg_w.size() == size_t(s.Co) * 4 * s.b.C ? with_tiles(s.mrg_w, 4 * s.b.C) : s.mrg_w);
+    U(b.mrg_b, s.mrg_b);
+    U(b.up_w, s.up_w);
+    U(b.up_b, s.up_b);
 }
 
 void Engine::init(Gpu& dev, const Kernels& k, const Weights& w) {
     dev_ = &dev, k_ = &k, w_ = &w;
+    std::vector<uint8_t> blob;
+    std::vector<Buffer*> refs;
+    blob.reserve(24ull << 20);
+    t_pack_blob = &blob;
+    t_pack_refs = &refs;
     for (int s = 0; s < 6; ++s) upload_stage(w.enc[s], enc_[s]);
     for (int l = 0; l < 5; ++l) upload_stage(w.dec0[l], dec0_[l]), upload_stage(w.dec1[l], dec1_[l]);
-    embed_w_ = upload(w.embed_w), embed_b_ = upload(w.embed_b), lut_ = upload(w.lut);
+    pack_bytes(dev_, fixed_, w.embed_w.data(), w.embed_w.size() * 2, &embed_w_);
+    pack_bytes(dev_, fixed_, w.embed_b.data(), w.embed_b.size() * 2, &embed_b_);
+    pack_bytes(dev_, fixed_, w.lut.data(), w.lut.size() * 2, &lut_);
     H16 masks(512);
     for (int i = 0; i < 256; ++i) masks[i] = (i % 16) < 8 ? 0x3c00 : 0, masks[256 + i] = (i % 16) < 8 ? 0 : 0x3c00;
-    masks_ = upload(masks);
-    flow_ = dev.create(10 * 512 * 4), fixed_.push_back(flow_);
+    pack_bytes(dev_, fixed_, masks.data(), masks.size() * 2, &masks_);
     auto tab = value_tables(), bic = bicubic_table();
-    tab_ = dev.create(tab.size() * 4), dev.upload(tab_, tab.data(), tab.size() * 4), fixed_.push_back(tab_);
-    bicubic_ = dev.create(bic.size() * 4), dev.upload(bicubic_, bic.data(), bic.size() * 4), fixed_.push_back(bicubic_);
+    pack_bytes(dev_, fixed_, tab.data(), tab.size() * 4, &tab_);
+    pack_bytes(dev_, fixed_, bic.data(), bic.size() * 4, &bicubic_);
+    t_pack_blob = nullptr;
+    t_pack_refs = nullptr;
+    if (!blob.empty()) {
+        Buffer wb = dev.create(blob.size() + 64);
+        dev.upload(wb, blob.data(), blob.size());
+        fixed_.push_back(wb);
+        for (Buffer* r : refs) r->addr += wb.addr;
+    }
+    flow_ = dev.create(10 * 512 * 4), fixed_.push_back(flow_);
     gtab_ = dev.create(sizeof(GuideTable)), fixed_.push_back(gtab_);
     hist_smp_ = dev.sampler(true, true);
 }
@@ -255,6 +305,7 @@ void Engine::init(Gpu& dev, const Kernels& k, const Weights& w) {
 void Engine::drop_display_history() {
     for (auto& b : dh_)
         if (b.addr) dev_->destroy(b);
+    nr_frame_ = ~0ull;
 }
 
 void Engine::drop_transparency_history() {
@@ -270,10 +321,13 @@ void Engine::destroy() {
     drop_display_history();
     drop_transparency_history();
     for (auto& i : hist_img_) dev_->destroy(i);
+    for (auto& h : hist_)
+        if (h.addr) dev_->destroy(h);
     if (hist_smp_) dev_->destroy(hist_smp_), hist_smp_ = VK_NULL_HANDLE;
     for (auto& b : sized_) dev_->destroy(b);
     for (auto& b : fixed_) dev_->destroy(b);
     sized_.clear(), fixed_.clear();
+    alloc_render_ = alloc_output_ = {};
     dev_ = nullptr;
 }
 
@@ -296,48 +350,158 @@ std::vector<std::string> Engine::kernel_names(const Weights& w, bool fast) {
     return n;
 }
 
-void Engine::resize(I2 render, I2 output) {
-    for (auto& i : hist_img_) dev_->destroy(i);
-    for (auto& b : sized_) dev_->destroy(b);
-    sized_.clear();
-    drop_display_history();
-    drop_transparency_history();
+void Engine::resize(I2 render, I2 output, I2 max_render) {
+    I2 cap = {std::max({render.x, max_render.x, alloc_render_.x}),
+              std::max({render.y, max_render.y, alloc_render_.y})};
+    const bool out_changed = output.x != alloc_output_.x || output.y != alloc_output_.y;
+    const bool need_alloc = sized_.empty() || out_changed || sized_fast_ != fast_ ||
+                            cap.x > alloc_render_.x || cap.y > alloc_render_.y;
+    if (out_changed) {
+        drop_display_history();
+        drop_transparency_history();
+    } else {
+        nr_frame_ = ~0ull;
+        tl_last_ = to_last_ = false;
+    }
     render_ = render, output_ = output;
     internal_ = {output.x * 3 / 2, output.y * 3 / 2};
     ds_ = half_up(internal_), ds2_ = half_up(ds_);
     pad_ = {(render.x + 31) & ~31, (render.y + 31) & ~31};
-    auto S = [&](size_t n) { Buffer b = make(n); sized_.push_back(b); return b; };
-    size_t rp = size_t(render.x) * render.y, ip = size_t(internal_.x) * internal_.y;
-    for (int s = 0; s < 6; ++s) {
-        I2 z = shr(pad_, s);
-        size_t px = size_t(z.x) * z.y;
-        int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
-        enc_l_[s].tensor = S(px * C), enc_l_[s].dfn = S(px * 8);
-        enc_l_[s].pooled = s ? S(px / 4 * std::max(Co, 32)) : Buffer{}, enc_l_[s].dfn_pool = S(px / 4 * 8);
+    const size_t rp = size_t(render.x) * render.y, ip = size_t(internal_.x) * internal_.y;
+    if (need_alloc) {
+        for (auto& b : sized_) dev_->destroy(b);
+        sized_.clear();
+        alloc_render_ = cap;
+        alloc_output_ = output;
+        const I2 apad = {(cap.x + 31) & ~31, (cap.y + 31) & ~31};
+        const size_t arp = size_t(cap.x) * cap.y;
+        auto S = [&](size_t n) { Buffer b = make(n); sized_.push_back(b); return b; };
+        auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+        size_t attrScratchBytes = 0;
+        size_t dec0ScratchBytes = 0;
+        if (fast_) {
+            for (int s = 1; s < 6; ++s) {
+                I2 z = shr(apad, s);
+                size_t px = size_t(z.x) * z.y;
+                int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
+                attrScratchBytes = align256(attrScratchBytes) + px * C;
+                attrScratchBytes = align256(attrScratchBytes) + px * 8;
+                if (s == 1) {
+                    dec0ScratchBytes = align256(dec0ScratchBytes) + px / 4 * std::max(Co, 32);
+                    dec0ScratchBytes = align256(dec0ScratchBytes) + px / 4 * 8;
+                } else {
+                    attrScratchBytes = align256(attrScratchBytes) + px / 4 * std::max(Co, 32);
+                    attrScratchBytes = align256(attrScratchBytes) + px / 4 * 8;
+                }
+            }
+            for (int l = 1; l < 5; ++l) {
+                I2 z = shr(apad, l);
+                size_t px = size_t(z.x) * z.y;
+                dec0ScratchBytes = align256(dec0ScratchBytes) + px * w_->dec0[l].b.C;
+                if (l == 1)
+                    attrScratchBytes = align256(attrScratchBytes) + px * w_->dec1[l].b.C;
+            }
+            const size_t px0 = size_t(apad.x) * apad.y;
+            dec0ScratchBytes = std::max(dec0ScratchBytes, px0 / 4 * 8);
+        }
+        for (int s = 0; s < 6; ++s) {
+            I2 z = shr(apad, s);
+            size_t px = size_t(z.x) * z.y;
+            int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
+            if (s >= 1 && fast_) {
+                enc_l_[s] = {};
+                continue;
+            }
+            enc_l_[s].tensor = S(px * C), enc_l_[s].dfn = S(px * 8);
+            enc_l_[s].pooled = s ? S(px / 4 * std::max(Co, 32)) : Buffer{};
+            enc_l_[s].dfn_pool = fast_ ? Buffer{} : S(px / 4 * 8);
+        }
+        for (int l = 0; l < 5; ++l) {
+            I2 z = shr(apad, l);
+            size_t px = size_t(z.x) * z.y;
+            const size_t dec0Bytes = px * w_->dec0[l].b.C;
+            const size_t postScratch = (!l && fast_) ? std::max((((ip * 4 + 255) & ~size_t(255)) + ip * 2), dec0ScratchBytes) : 0;
+            dec0_l_[l].tensor = (l >= 1 && fast_) ? Buffer{} : S(std::max(dec0Bytes, postScratch));
+            dec1_l_[l].tensor = (l && !(l == 1 && fast_)) ? S(px * w_->dec1[l].b.C) : Buffer{};
+            dec1_l_[l].dfn = (!l && fast_) ? Buffer{} : S(px * 8);
+        }
+        // fast: one 48-byte record per grid pixel (enc0_attr.comp, ATTR64); else 48 fp16 attributes per image pixel
+        const size_t attrBytes = fast_ ? size_t(apad.x) * apad.y * 48 : arp * 96;
+        const size_t headScratch = fast_ ? (((arp * 24 + 255) & ~size_t(255)) + ((arp * 8 + 255) & ~size_t(255)) + ((arp * 4 + 255) & ~size_t(255)) * 2) : 0;
+        attr_ = S(std::max({attrBytes, headScratch, attrScratchBytes})), img_ = S(size_t(apad.x) * apad.y * 8), ero_ = S(arp * 4), nond_ = S(arp * 4);
+        for (int i = 0; i < 2; ++i) {
+            pmv2_[i] = S(arp * 8), hidden_[i] = S(arp * 4), down_[i] = S(size_t(ds_.x) * ds_.y * 4);
+            expo_[i] = S(4);
+        }
+        pdst_ = S(size_t(ds2_.x) * ds2_.y * 4), acc_ = S(16), blk_ = S(16);
+        if (!fast_) {
+            tile_ = S(arp * 24);
+            fix_ = S(post_fix_bytes(internal_)), frg_ = S(ip * 4), fb_ = S(ip * 2);
+            ajab_ = S(arp * 4), mvf_ = S(arp * 4), aniso_ = S(arp * 8);
+        }
+        prm_ = S(kBlockBytes + 64);
+        attr_wide_ = {};
+        if (out_changed || !hist_[0].addr) {
+            for (auto& i : hist_img_) dev_->destroy(i);
+            for (auto& h : hist_)
+                if (h.addr) dev_->destroy(h);
+            for (int i = 0; i < 2; ++i) {
+                hist_[i] = make(ip * 8);
+                hist_img_[i] = dev_->alias_image(hist_[i], uint32_t(internal_.x), uint32_t(internal_.y), VK_FORMAT_R16G16B16A16_SFLOAT, 8);
+                if (hist_img_[i].img) dev_->set_texture(uint32_t(i), hist_img_[i], hist_smp_);
+            }
+        }
+        sized_fast_ = fast_;
     }
-    for (int l = 0; l < 5; ++l) {
-        I2 z = shr(pad_, l);
-        size_t px = size_t(z.x) * z.y;
-        dec0_l_[l].tensor = S(px * w_->dec0[l].b.C);
-        dec1_l_[l].tensor = l ? S(px * w_->dec1[l].b.C) : Buffer{};
-        dec1_l_[l].dfn = S(px * 8);
+    if (fast_) {
+        const uint64_t t0 = attr_.addr;
+        const uint64_t t1 = t0 + ((rp * 24 + 255) & ~size_t(255));
+        const uint64_t t2 = t1 + ((rp * 8 + 255) & ~size_t(255));
+        const uint64_t t3 = t2 + ((rp * 4 + 255) & ~size_t(255));
+        tile_ = Buffer{}, tile_.addr = t0, tile_.size = rp * 24;
+        aniso_ = Buffer{}, aniso_.addr = t1, aniso_.size = rp * 8;
+        ajab_ = Buffer{}, ajab_.addr = t2, ajab_.size = rp * 4;
+        mvf_ = Buffer{}, mvf_.addr = t3, mvf_.size = rp * 4;
+        const uint64_t f0 = dec0_l_[0].tensor.addr;
+        const uint64_t f1 = f0 + ((ip * 4 + 255) & ~size_t(255));
+        dec1_l_[0].dfn = Buffer{}, dec1_l_[0].dfn.addr = img_.addr, dec1_l_[0].dfn.size = size_t(pad_.x) * pad_.y * 8;
+        frg_ = Buffer{}, frg_.addr = f0, frg_.size = ip * 4;
+        fb_ = Buffer{}, fb_.addr = f1, fb_.size = ip * 2;
+        fix_ = Buffer{};
+        auto sub = [](uint64_t base, size_t& cur, size_t sz) {
+            cur = (cur + 255) & ~size_t(255);
+            Buffer b{};
+            b.addr = base + cur;
+            b.size = sz;
+            cur += sz;
+            return b;
+        };
+        size_t aOff = 0, dOff = 0;
+        for (int s = 1; s < 6; ++s) {
+            I2 z = shr(pad_, s);
+            size_t px = size_t(z.x) * z.y;
+            int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
+            enc_l_[s].tensor = sub(t0, aOff, px * C);
+            enc_l_[s].dfn = sub(t0, aOff, px * 8);
+            if (s == 1) {
+                enc_l_[s].pooled = sub(f0, dOff, px / 4 * std::max(Co, 32));
+                enc_l_[s].dfn_pool = sub(f0, dOff, px / 4 * 8);
+            } else {
+                enc_l_[s].pooled = sub(t0, aOff, px / 4 * std::max(Co, 32));
+                enc_l_[s].dfn_pool = sub(t0, aOff, px / 4 * 8);
+            }
+        }
+        // enc_l_[0].dfn_pool is written in launch 3 and consumed in launch 4 (enc1); dec0_l_[1..4] are written in launches 10..20.
+        const size_t dOffAfterEnc1Pool = (dOff + 255) & ~size_t(255);
+        enc_l_[0].dfn_pool = Buffer{}, enc_l_[0].dfn_pool.addr = f0 + dOffAfterEnc1Pool, enc_l_[0].dfn_pool.size = size_t(pad_.x) * pad_.y / 4 * 8;
+        for (int l = 1; l < 5; ++l) {
+            I2 z = shr(pad_, l);
+            size_t px = size_t(z.x) * z.y;
+            dec0_l_[l].tensor = sub(f0, dOff, px * w_->dec0[l].b.C);
+            if (l == 1)
+                dec1_l_[l].tensor = sub(t0, aOff, px * w_->dec1[l].b.C);
+        }
     }
-    // fast: one 48-byte record per grid pixel (enc0_attr.comp, ATTR64); else 48 fp16 attributes per image pixel
-    attr_ = S(fast_ ? size_t(pad_.x) * pad_.y * 48 : rp * 96), img_ = S(size_t(pad_.x) * pad_.y * 8), ero_ = S(rp * 4), nond_ = S(rp * 4);
-    for (int i = 0; i < 2; ++i) {
-        pmv2_[i] = S(rp * 8), hidden_[i] = S(rp * 4), down_[i] = S(size_t(ds_.x) * ds_.y * 4), hist_[i] = S(ip * 8);
-        expo_[i] = S(4);
-    }
-    pdst_ = S(size_t(ds2_.x) * ds2_.y * 4), acc_ = S(16), blk_ = S(16), tile_ = S(rp * 24);
-    fix_ = fast_ ? Buffer{} : S(post_fix_bytes(internal_)), frg_ = S(ip * 4), fb_ = S(ip * 2);
-    // prm_: the enc0 block, then the optional guide table enc0_attr reads (record_net)
-    ajab_ = S(rp * 4), mvf_ = S(rp * 4), aniso_ = S(rp * 8), prm_ = S(kBlockBytes + 64);
-    attr_wide_ = {};
-    for (int i = 0; i < 2; ++i) {
-        hist_img_[i] = dev_->alias_image(hist_[i], uint32_t(internal_.x), uint32_t(internal_.y), VK_FORMAT_R16G16B16A16_SFLOAT, 8);
-        if (hist_img_[i].img) dev_->set_texture(uint32_t(i), hist_img_[i], hist_smp_);
-    }
-    sized_fast_ = fast_;
     fresh_ = true;
 }
 
@@ -377,6 +541,7 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
     Enc0BlockInput bi{f.render, internal_, ds_, {f.jitter[0], f.jitter[1]}, {prev_jitter_[0], prev_jitter_[1]},
                       {f.mv_scale[0], f.mv_scale[1]}, w2v, v2c, pw2v, pv2c, W.enc0_scalars, f.depth_sign};
     auto blk = enc0_block(bi);
+    if (fresh_) d.fill(expo_[old], 0, 4, 0);
     d.update(prm_, 0, kBlockBytes, blk.data());
     const bool dg = g.direct && direct_guides_ok();
     if (dg) d.update(gtab_, 0, sizeof(GuideTable), g.direct);
@@ -419,7 +584,8 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
             a.hist_off |= 2u;
         }
         if (wide) {
-            if (!attr_wide_.addr) attr_wide_ = dev_->create(size_t(pad_.x) * pad_.y * 64 + 64), sized_.push_back(attr_wide_);
+            const I2 apad = {(alloc_render_.x + 31) & ~31, (alloc_render_.y + 31) & ~31};
+            if (!attr_wide_.addr) attr_wide_ = dev_->create(size_t(apad.x) * apad.y * 64 + 64), sized_.push_back(attr_wide_);
             a.attr = attr_wide_.addr;
             attr_k += "_w";
         }
