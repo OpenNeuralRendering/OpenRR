@@ -100,7 +100,7 @@ public:
     // resize() sizes some buffers for the mode (the fast record, the faithful post's fixup list)
     bool sized_for_mode() const { return sized_fast_ == fast_; }
     // (re)allocates everything sized by the frame (outside a recording: it uploads); the history starts over
-    void resize(I2 render, I2 output);
+    void resize(I2 render, I2 output, I2 max_render = {});
     I2 render() const { return render_; }
     I2 output() const { return output_; }
     // out: rgba16f, output.x * output.y
@@ -171,7 +171,7 @@ private:
     StageBufs enc_[6], dec0_[5], dec1_[5];
     Buffer embed_w_, embed_b_, lut_, masks_, tab_, bicubic_, gtab_;
     Buffer flow_;   // row flags of the _fl kernels (onr_flow.glsl): 10 slots x 512 words
-    I2 render_{}, output_{}, internal_{}, ds_{}, ds2_{}, pad_{};
+    I2 render_{}, output_{}, alloc_render_{}, alloc_output_{}, internal_{}, ds_{}, ds2_{}, pad_{};
     uint64_t frame_ = 0;
     uint64_t nr_frame_ = ~0ull;   // frame_ of the last post that wrote the delta history
     float dh_alpha_ = 0.05f;

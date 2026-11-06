@@ -43,6 +43,7 @@ public:
     static constexpr uint32_t kSlotQueries = 192;  // timestamps per recording
     static constexpr uint32_t kSlotViews = 18;     // set 0 of the d3d_ kernels per recording: 16 SRVs, then 2 UAVs
     static constexpr uint32_t kTableViews = 12;    // set 0 of the others: 8 combined image samplers of 48 bytes
+    static constexpr uint32_t kSlotStride = kSlotViews + kTableViews;
 
     ~D3dDevice() override;
     // dev: the game's device (kept referenced). compiler: the Vulkan device on the same adapter that builds the
@@ -137,7 +138,8 @@ private:
     ID3D12DescriptorHeap* heap_ = nullptr;
     uint64_t heap_cpu_ = 0, heap_gpu_ = 0;
     uint32_t desc_lo_ = 0;             // root constant 61 of the bound recording (d3d_ kernels)
-    uint32_t table_lo_ = 0;            // root constant 61 of the others
+    uint32_t table_lo_ = 0;            // root constant 61 of the others (per-slot snapshot)
+    uint8_t tex_table_[8][48] = {};
     std::unique_ptr<Device> srd_;      // descriptors of linear images (alias_image)
     bool srd_ok_ = false;
     std::map<uint64_t, std::array<uint8_t, 48>> images_;
