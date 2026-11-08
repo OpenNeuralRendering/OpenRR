@@ -1283,7 +1283,6 @@ int32_t Create(const OnrRrCreateInfo* in, void** out) {
         DeviceOptions o;
         o.luid = reinterpret_cast<const uint8_t*>(&luid);
         o.interop = true;
-        o.descriptors = true;
         std::string err;
         if (!c->dev.init(err, o)) throw std::runtime_error("Vulkan: " + err);
         // timestamps only at the submit's boundaries: one around every dispatch serialises the ones without a barrier
