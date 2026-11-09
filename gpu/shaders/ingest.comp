@@ -61,7 +61,8 @@ void main() {
         if (dst == 0ul) continue;   // a slot without a destination
         uvec4 g = pc.g[s];
         uint kind = (g.z >> 8) & 255u, flags = (g.z >> 16) & 255u, channel = g.z >> 24;
-        vec4 c = cs[s];
+        // NaN -> 0 first: on AMD clamp() turns a NaN into -65504, a large negative colour the network and history spread
+        vec4 c = mix(cs[s], vec4(0.0), isnan(cs[s]));
         if ((flags & 64u) != 0u) c.x *= pc.proj.x;
         if ((flags & 16u) != 0u) c.x = 1.0 - c.x;
         if ((flags & 32u) != 0u) c.x = clamp(c.x, 0.0, 1.0);
