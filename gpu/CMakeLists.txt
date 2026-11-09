@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.24)
 project(opennr_rr LANGUAGES CXX)
+# A game may load its own older msvcp140.dll first (Alan Wake 2 ships 14.34): without this, std::mutex from a newer
+# toolset faults in mtx_do_lock on its first lock. OptiScaler builds with the same define.
+add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
