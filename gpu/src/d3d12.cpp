@@ -308,7 +308,8 @@ void D3dDevice::bind(ID3D12GraphicsCommandList* cl, uint32_t slot) {
         const uint64_t base_desc = uint64_t(slot_) * kSlotStride * 32;
         desc_lo_ = uint32_t(heap_gpu_ + base_desc);
         table_lo_ = desc_lo_ + kSlotViews * 32;
-        memcpy(reinterpret_cast<uint8_t*>(heap_cpu_ + base_desc + kSlotViews * 32), tex_table_, sizeof(tex_table_));
+        // only a heap init_sampler found CPU-writable: under ReShade's add-on hooks its CPU handle is not memory
+        if (srd_ok_) memcpy(reinterpret_cast<uint8_t*>(heap_cpu_ + base_desc + kSlotViews * 32), tex_table_, sizeof(tex_table_));
     } else {
         desc_lo_ = table_lo_ = 0;
     }
