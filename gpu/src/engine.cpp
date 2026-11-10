@@ -237,6 +237,20 @@ static H16 lr_keys(const H16& a, int C, int X) {
     return o;
 }
 
+// O_h out_h = P (x in_b_h^T) out_h^T: the value path is linear, so at C = 32, where a head has as many dims as channels,
+// wout_h in_b_h in in_b's layout makes the out projection unnecessary (LT_VO)
+static H16 vo_values(const H16& in_b, const H16& out, int C, int X) {
+    H16 m(in_b.size());
+    for (int h = 0; h < X / 32; ++h)
+        for (int d = 0; d < 32; ++d)
+            for (int k = 0; k < C; ++k) {
+                double v = 0;
+                for (int e = 0; e < 32; ++e) v += double(h2f(out[size_t(d) * X + h * 32 + e])) * h2f(in_b[size_t(h * 32 + e) * C + k]);
+                m[size_t(h) * 32 * C + d * C + k] = f2h(float(v));
+            }
+    return m;
+}
+
 Buffer Engine::upload_qv(const H16& v, const H16& lr) {
     if (v.empty()) return {};
     auto d = qv_bytes(v.data(), v.size());
@@ -255,7 +269,7 @@ void Engine::upload_stage(const StageWeights& s, StageBufs& b) {
         pack_bytes(dev_, fixed_, d.data(), d.size(), &dst);
     };
     UQ(b.in_a, s.b.in_a, s.b.C == 32 ? lr_keys(s.b.in_a, s.b.C, s.b.X) : H16{});
-    UQ(b.in_b, s.b.in_b, {});
+    UQ(b.in_b, s.b.in_b, s.b.C == 32 ? vo_values(s.b.in_b, s.b.out, s.b.C, s.b.X) : H16{});
     U(b.out, with_tiles(s.b.out, s.b.X));
     U(b.out_b, s.b.out_b);
     U(b.fc1, with_tiles(s.b.fc1, s.b.C));
@@ -350,6 +364,54 @@ std::vector<std::string> Engine::kernel_names(const Weights& w, bool fast) {
     return n;
 }
 
+// The fast mode's frame-scoped buffers in one arena, by when each is live (launch order in record_net; every overlap
+// below has a barrier between its last read and its first write). Returns the bytes; with base, sets the addresses.
+//   R0  enc0 tensor (attr .. dec_up_0), then the head's tile, ajab and mvf (head .. post)
+//   R1  enc0 DFN (enc0 .. head)
+//   R2  the image (attr .. enc0), then enc1's DFN and the small decoder levels (.. dec_dfn_1), then the head's DFN
+//   X   enc0's DFN pool + the attribute records (attr .. enc1)
+//       enc1's pooled outputs, enc2..5, dec0_2, dec1_2 from the bottom, enc1's tensor at the top (enc1 .. dec_up_1)
+//       dec0_1 from the bottom (dec_up_1 .. dec_dfn_1); dec1_1's tensor in enc1's place, its DFN just below (.. dec_up_0 / head)
+//       dec0_0 from the bottom (dec_up_0 .. head); aniso at the top (head .. post_tile)
+//   R1 up  the post's colour (post .. downsample)
+// The levels on row flags (enc2 .. dec2_1) run without barriers: they never share bytes with each other.
+size_t Engine::fast_layout(I2 pad, size_t rp, size_t ip, uint64_t base) {
+    auto A = [](size_t n) { return (n + 64 + 255) & ~size_t(255); };
+    auto at = [&](size_t off, size_t n) { Buffer b{}; b.addr = base + off, b.size = n; return b; };
+    auto px = [&](int l) { I2 z = shr(pad, l); return size_t(z.x) * z.y; };
+    const size_t p0 = px(0), p1 = px(1), t24 = A(rp * 24), t8 = A(rp * 8), t4 = A(rp * 4);
+    const size_t r0 = std::max(A(p0 * w_->enc[0].b.C), t24 + 2 * t4), r1 = r0, img = A(p0 * 8), r2 = r1 + A(p0 * 8);
+    tile_ = at(0, rp * 24), ajab_ = at(t24, rp * 4), mvf_ = at(t24 + t4, rp * 4), aniso_ = {}, fix_ = {};
+    enc_l_[0].tensor = at(0, p0 * w_->enc[0].b.C), enc_l_[0].dfn = at(r1, p0 * 8), enc_l_[0].pooled = {};
+    img_ = at(r2, p0 * 8), dec1_l_[0].dfn = at(r2, p0 * 8), dec1_l_[0].tensor = {};
+    size_t c2 = r2;
+    auto R2 = [&](size_t n) { Buffer b = at(c2, n); c2 += A(n); return b; };
+    enc_l_[1].dfn = R2(p1 * 8);
+    for (int l : {3, 4}) dec0_l_[l].tensor = R2(px(l) * w_->dec0[l].b.C), dec1_l_[l].tensor = R2(px(l) * w_->dec1[l].b.C);
+    for (int l : {2, 3, 4}) dec1_l_[l].dfn = R2(px(l) * 8);
+    const size_t x = std::max(c2, r2 + img);
+    const size_t pool = A(p0 / 4 * 8), t1 = A(p1 * std::max(w_->enc[1].b.C, w_->dec1[1].b.C)), d1 = A(p1 * 8);
+    // the middle stack, from the pool up
+    size_t b = pool;
+    auto B = [&](size_t n) { Buffer r = at(x + b, n); b += A(n); return r; };
+    enc_l_[1].pooled = B(p1 / 4 * std::max(w_->enc[1].Co, 32)), enc_l_[1].dfn_pool = B(p1 / 4 * 8);
+    for (int s = 2; s < 6; ++s) {
+        enc_l_[s].tensor = B(px(s) * w_->enc[s].b.C), enc_l_[s].dfn = B(px(s) * 8);
+        enc_l_[s].pooled = B(px(s) / 4 * std::max(w_->enc[s].Co, 32)), enc_l_[s].dfn_pool = B(px(s) / 4 * 8);
+    }
+    dec0_l_[2].tensor = B(px(2) * w_->dec0[2].b.C), dec1_l_[2].tensor = B(px(2) * w_->dec1[2].b.C);
+    const size_t d00 = A(p0 * w_->dec0[0].b.C), d01 = A(p1 * w_->dec0[1].b.C), attr = A(p0 * 48);
+    const size_t xn = std::max({pool + attr, b + t1, d00 + d1 + t1, d01 + d1 + t1, t8 + t1});
+    enc_l_[0].dfn_pool = at(x, p0 / 4 * 8), attr_ = at(x + pool, p0 * 48);
+    enc_l_[1].tensor = at(x + xn - t1, p1 * w_->enc[1].b.C), dec1_l_[1].tensor = at(x + xn - t1, p1 * w_->dec1[1].b.C);
+    dec1_l_[1].dfn = at(x + xn - t1 - d1, p1 * 8);
+    dec0_l_[0].tensor = at(x, p0 * w_->dec0[0].b.C), dec0_l_[1].tensor = at(x, p1 * w_->dec0[1].b.C);
+    aniso_ = at(x + xn - t1, rp * 8);
+    const size_t f4 = A(ip * 4);
+    frg_ = at(r1, ip * 4), fb_ = at(r1 + f4, ip * 2);
+    return std::max(x + xn, r1 + f4 + A(ip * 2));
+}
+
 void Engine::resize(I2 render, I2 output, I2 max_render) {
     I2 cap = {std::max({render.x, max_render.x, alloc_render_.x}),
               std::max({render.y, max_render.y, alloc_render_.y})};
@@ -376,63 +438,34 @@ void Engine::resize(I2 render, I2 output, I2 max_render) {
         const I2 apad = {(cap.x + 31) & ~31, (cap.y + 31) & ~31};
         const size_t arp = size_t(cap.x) * cap.y;
         auto S = [&](size_t n) { Buffer b = make(n); sized_.push_back(b); return b; };
-        auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
-        size_t attrScratchBytes = 0;
-        size_t dec0ScratchBytes = 0;
         if (fast_) {
-            for (int s = 1; s < 6; ++s) {
+            arena_ = S(fast_layout(apad, arp, ip, 0));
+        } else {
+            for (int s = 0; s < 6; ++s) {
                 I2 z = shr(apad, s);
                 size_t px = size_t(z.x) * z.y;
                 int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
-                attrScratchBytes = align256(attrScratchBytes) + px * C;
-                attrScratchBytes = align256(attrScratchBytes) + px * 8;
-                if (s == 1) {
-                    dec0ScratchBytes = align256(dec0ScratchBytes) + px / 4 * std::max(Co, 32);
-                    dec0ScratchBytes = align256(dec0ScratchBytes) + px / 4 * 8;
-                } else {
-                    attrScratchBytes = align256(attrScratchBytes) + px / 4 * std::max(Co, 32);
-                    attrScratchBytes = align256(attrScratchBytes) + px / 4 * 8;
-                }
+                enc_l_[s].tensor = S(px * C), enc_l_[s].dfn = S(px * 8);
+                enc_l_[s].pooled = s ? S(px / 4 * std::max(Co, 32)) : Buffer{};
+                enc_l_[s].dfn_pool = S(px / 4 * 8);
             }
-            for (int l = 1; l < 5; ++l) {
+            for (int l = 0; l < 5; ++l) {
                 I2 z = shr(apad, l);
                 size_t px = size_t(z.x) * z.y;
-                dec0ScratchBytes = align256(dec0ScratchBytes) + px * w_->dec0[l].b.C;
-                if (l == 1)
-                    attrScratchBytes = align256(attrScratchBytes) + px * w_->dec1[l].b.C;
+                dec0_l_[l].tensor = S(px * w_->dec0[l].b.C);
+                dec1_l_[l].tensor = l ? S(px * w_->dec1[l].b.C) : Buffer{};
+                dec1_l_[l].dfn = S(px * 8);
             }
-            const size_t px0 = size_t(apad.x) * apad.y;
-            dec0ScratchBytes = std::max(dec0ScratchBytes, px0 / 4 * 8);
+            // 48 fp16 attributes per image pixel
+            attr_ = S(arp * 96), img_ = S(size_t(apad.x) * apad.y * 8);
         }
-        for (int s = 0; s < 6; ++s) {
-            I2 z = shr(apad, s);
-            size_t px = size_t(z.x) * z.y;
-            int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
-            if (s >= 1 && fast_) {
-                enc_l_[s] = {};
-                continue;
-            }
-            enc_l_[s].tensor = S(px * C), enc_l_[s].dfn = S(px * 8);
-            enc_l_[s].pooled = s ? S(px / 4 * std::max(Co, 32)) : Buffer{};
-            enc_l_[s].dfn_pool = fast_ ? Buffer{} : S(px / 4 * 8);
-        }
-        for (int l = 0; l < 5; ++l) {
-            I2 z = shr(apad, l);
-            size_t px = size_t(z.x) * z.y;
-            const size_t dec0Bytes = px * w_->dec0[l].b.C;
-            const size_t postScratch = (!l && fast_) ? std::max((((ip * 4 + 255) & ~size_t(255)) + ip * 2), dec0ScratchBytes) : 0;
-            dec0_l_[l].tensor = (l >= 1 && fast_) ? Buffer{} : S(std::max(dec0Bytes, postScratch));
-            dec1_l_[l].tensor = (l && !(l == 1 && fast_)) ? S(px * w_->dec1[l].b.C) : Buffer{};
-            dec1_l_[l].dfn = (!l && fast_) ? Buffer{} : S(px * 8);
-        }
-        // fast: one 48-byte record per grid pixel (enc0_attr.comp, ATTR64); else 48 fp16 attributes per image pixel
-        const size_t attrBytes = fast_ ? size_t(apad.x) * apad.y * 48 : arp * 96;
-        const size_t headScratch = fast_ ? (((arp * 24 + 255) & ~size_t(255)) + ((arp * 8 + 255) & ~size_t(255)) + ((arp * 4 + 255) & ~size_t(255)) * 2) : 0;
-        attr_ = S(std::max({attrBytes, headScratch, attrScratchBytes})), img_ = S(size_t(apad.x) * apad.y * 8), ero_ = S(arp * 4), nond_ = S(arp * 4);
+        ero_ = S(arp * 4), nond_ = S(arp * 4);
         for (int i = 0; i < 2; ++i) {
-            pmv2_[i] = S(arp * 8), hidden_[i] = S(arp * 4), down_[i] = S(size_t(ds_.x) * ds_.y * 4);
+            pmv2_[i] = S(arp * 8);
             expo_[i] = S(4);
         }
+        // read before this frame's write (enc0_attr; the head and the post write them later): one buffer for both
+        hidden_[0] = hidden_[1] = S(arp * 4), down_[0] = down_[1] = S(size_t(ds_.x) * ds_.y * 4);
         pdst_ = S(size_t(ds2_.x) * ds2_.y * 4), acc_ = S(16), blk_ = S(16);
         if (!fast_) {
             tile_ = S(arp * 24);
@@ -453,55 +486,7 @@ void Engine::resize(I2 render, I2 output, I2 max_render) {
         }
         sized_fast_ = fast_;
     }
-    if (fast_) {
-        const uint64_t t0 = attr_.addr;
-        const uint64_t t1 = t0 + ((rp * 24 + 255) & ~size_t(255));
-        const uint64_t t2 = t1 + ((rp * 8 + 255) & ~size_t(255));
-        const uint64_t t3 = t2 + ((rp * 4 + 255) & ~size_t(255));
-        tile_ = Buffer{}, tile_.addr = t0, tile_.size = rp * 24;
-        aniso_ = Buffer{}, aniso_.addr = t1, aniso_.size = rp * 8;
-        ajab_ = Buffer{}, ajab_.addr = t2, ajab_.size = rp * 4;
-        mvf_ = Buffer{}, mvf_.addr = t3, mvf_.size = rp * 4;
-        const uint64_t f0 = dec0_l_[0].tensor.addr;
-        const uint64_t f1 = f0 + ((ip * 4 + 255) & ~size_t(255));
-        dec1_l_[0].dfn = Buffer{}, dec1_l_[0].dfn.addr = img_.addr, dec1_l_[0].dfn.size = size_t(pad_.x) * pad_.y * 8;
-        frg_ = Buffer{}, frg_.addr = f0, frg_.size = ip * 4;
-        fb_ = Buffer{}, fb_.addr = f1, fb_.size = ip * 2;
-        fix_ = Buffer{};
-        auto sub = [](uint64_t base, size_t& cur, size_t sz) {
-            cur = (cur + 255) & ~size_t(255);
-            Buffer b{};
-            b.addr = base + cur;
-            b.size = sz;
-            cur += sz;
-            return b;
-        };
-        size_t aOff = 0, dOff = 0;
-        for (int s = 1; s < 6; ++s) {
-            I2 z = shr(pad_, s);
-            size_t px = size_t(z.x) * z.y;
-            int C = w_->enc[s].b.C, Co = w_->enc[s].Co;
-            enc_l_[s].tensor = sub(t0, aOff, px * C);
-            enc_l_[s].dfn = sub(t0, aOff, px * 8);
-            if (s == 1) {
-                enc_l_[s].pooled = sub(f0, dOff, px / 4 * std::max(Co, 32));
-                enc_l_[s].dfn_pool = sub(f0, dOff, px / 4 * 8);
-            } else {
-                enc_l_[s].pooled = sub(t0, aOff, px / 4 * std::max(Co, 32));
-                enc_l_[s].dfn_pool = sub(t0, aOff, px / 4 * 8);
-            }
-        }
-        // enc_l_[0].dfn_pool is written in launch 3 and consumed in launch 4 (enc1); dec0_l_[1..4] are written in launches 10..20.
-        const size_t dOffAfterEnc1Pool = (dOff + 255) & ~size_t(255);
-        enc_l_[0].dfn_pool = Buffer{}, enc_l_[0].dfn_pool.addr = f0 + dOffAfterEnc1Pool, enc_l_[0].dfn_pool.size = size_t(pad_.x) * pad_.y / 4 * 8;
-        for (int l = 1; l < 5; ++l) {
-            I2 z = shr(pad_, l);
-            size_t px = size_t(z.x) * z.y;
-            dec0_l_[l].tensor = sub(f0, dOff, px * w_->dec0[l].b.C);
-            if (l == 1)
-                dec1_l_[l].tensor = sub(t0, aOff, px * w_->dec1[l].b.C);
-        }
-    }
+    if (fast_) fast_layout(pad_, rp, ip, arena_.addr);
     fresh_ = true;
 }
 

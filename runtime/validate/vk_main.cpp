@@ -11,6 +11,7 @@
 // times without new guides (timing: the runtime's GPU time, and the host's timestamps around RecordVk).
 // ONR_VALIDATE_VK_NOVIEWS=1: no views given (everything copied). ONR_VALIDATE_LOAD=n: n copies of 256 MB in the command buffer before the evaluate.
 // ONR_VALIDATE_RENDER=WxH: the first feature renders at WxH (the guides' top left corner).
+// ONR_VALIDATE_DRS=n: every other n frames at 85% of that size (DRS within the size given at Create).
 // ONR_VALIDATE_POISON=1: the guides' top quarter as a sky (depth 0, zero normals and albedos) plus inf / NaN texels
 // in the colour and the motion.
 // ONR_VALIDATE_VK_SECOND=1: a second feature as Indiana Jones makes one (426x240 -> 640x360, the scene's top left corner),
@@ -361,7 +362,11 @@ int wmain(int argc, wchar_t** argv) {
         a5.v4.GetBackend(ctx, &backend);
         // ONR_VALIDATE_FAST=1: the runtime's fast mode from the start; ONR_VALIDATE_FAST_FLIP=n: flipped every n frames
         auto set_fast = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFastMode"));
+        // ONR_VALIDATE_FAST_AT=n: asked at frame n and waited for there, so the frames after it do not depend on how long
+        // the kernels take to build (with ONR_VALIDATE_FAST the switch lands on whatever frame finds them built)
+        auto get_fast = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFastMode"));
         const int fast_flip = getenv("ONR_VALIDATE_FAST_FLIP") ? atoi(getenv("ONR_VALIDATE_FAST_FLIP")) : 0;
+        const int fast_at = getenv("ONR_VALIDATE_FAST_AT") ? atoi(getenv("ONR_VALIDATE_FAST_AT")) : -1;
         if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, 1);
         printf("render %ux%u -> %ux%u, %d frames, _f, backend %s, guides %s, depth %s\n", RW, RH, OW, OH, nframes,
                backend == ONR_RR_BACKEND_VULKAN_HOST ? "Vulkan host" : "other", general ? "GENERAL" : "SHADER_READ_ONLY_OPTIMAL",
@@ -484,6 +489,9 @@ int wmain(int argc, wchar_t** argv) {
             auto jit = json_list(js, at, "jitter"), mvs = json_list(js, at, "mv_scale"), rst = json_list(js, at, "reset");
             auto w2v = json_list(js, at, "world_to_view"), v2c = json_list(js, at, "view_to_clip");
             fr.render_width = cw, fr.render_height = chh;
+            // ONR_VALIDATE_DRS=n: every other n frames at 85% of the render size, the guides' top-left corner (DRS within max_render)
+            if (const char* drs = getenv("ONR_VALIDATE_DRS"); drs && (f / std::max(atoi(drs), 1)) & 1)
+                fr.render_width = (cw * 85 / 100) & ~1u, fr.render_height = (chh * 85 / 100) & ~1u;
             fr.jitter_x = float(jit[0]), fr.jitter_y = float(jit[1]);
             fr.mv_scale_x = float(mvs[0]), fr.mv_scale_y = float(mvs[1]);
             for (int i = 0; i < 16; ++i) fr.world_to_view[i] = float(w2v[i]), fr.view_to_clip[i] = float(v2c[i]);
@@ -570,7 +578,14 @@ int wmain(int argc, wchar_t** argv) {
         double lo = 1e9, hi = 0;
         for (int f = 0; f < nframes; ++f) {
             if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? 1 : 0);
+            if (f == fast_at && set_fast) set_fast(ctx, 1);
             if (f) run_frame(f, true);
+            if (f == fast_at && get_fast) {
+                const auto w0 = std::chrono::steady_clock::now();
+                while (get_fast(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                printf("fast mode ready %.2f s after it was asked for (state %d)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(),
+                       get_fast(ctx));
+            }
             api.GetInfo(ctx, &info);
             const uint16_t* m = static_cast<const uint16_t*>(rb.map);
             wchar_t p[MAX_PATH];

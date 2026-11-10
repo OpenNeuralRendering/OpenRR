@@ -208,16 +208,18 @@ void main() {
             MA a_; CPA(a_, xt) MMA(va, a_, wb0) MMA(vb, a_, wb1) }
 #define QV_K(n, xa, xb, xc, xd) { MA wa0, wa1; MB wb0, wb1; \
             coopMatLoad(wa0, pc.in_a.v, QA_LR(wq + (n) * 16u), ENC_C, ROW); Q2_IF { coopMatLoad(wa1, pc.in_a.v, wq + 16u * ENC_C + (n) * 16u, ENC_C, ROW); } \
-            coopMatLoad(wb0, pc.in_b.v, wq + (n) * 16u, ENC_C, COL); coopMatLoad(wb1, pc.in_b.v, wq + 16u * ENC_C + (n) * 16u, ENC_C, COL); \
+            coopMatLoad(wb0, pc.in_b.v, VB_LR(wq + (n) * 16u), ENC_C, COL); coopMatLoad(wb1, pc.in_b.v, VB_LR(wq + 16u * ENC_C + (n) * 16u), ENC_C, COL); \
             QV_TOK(xa, q00, q01, v00, v01) QV_TOK(xb, q10, q11, v10, v11) QV_TOK(xc, q20, q21, v20, v21) QV_TOK(xd, q30, q31, v30, v31) }
         QV_K(0u, x00, x10, x20, x30)
         QV_K(1u, x01, x11, x21, x31)
+#ifndef LT_VO
         // out projection fragments of the head: [channel tile][dim tile], K = 32 hd + dims
         MA wo00, wo01, wo10, wo11;
         coopMatLoad(wo00, pc.wout.v, WT_OUT(hd * 32u), WS_OUT, ROW);
         coopMatLoad(wo01, pc.wout.v, WT_OUT(hd * 32u + 16u), WS_OUT, ROW);
         coopMatLoad(wo10, pc.wout.v, WT_OUT(16u * ENC_X + hd * 32u), WS_OUT, ROW);
         coopMatLoad(wo11, pc.wout.v, WT_OUT(16u * ENC_X + hd * 32u + 16u), WS_OUT, ROW);
+#endif
         // own token tile: S^T [64 keys][16] = Q_keys Q_own^T + bias^T, softmax in registers (the transposed body's
         // tree), O^T = V^T P^T, then the out projection into its accumulators
 #define ATT(r0_, qo0, qo1, ca0, ca1) { \
@@ -259,14 +261,25 @@ void main() {
                 p0[e] = u0.x, p0[e + 1] = u0.y, p1[e] = u1.x, p1[e + 1] = u1.y; \
                 p2[e] = u2.x, p2[e + 1] = u2.y, p3[e] = u3.x, p3[e + 1] = u3.y; \
             } \
-            ACC o0 = ACC(0.0), o1 = ACC(0.0); \
+            ATT_OUT(r0_, ca0, ca1) }
+#ifdef LT_VO
+// the value path is linear: V_h already through wout_h in_b_h (Engine::upload_stage), so P V_h goes straight into the out
+// accumulators, without the 16 products per head of the out projection
+#define ATT_OUT(r0_, o0, o1) { MB b_; MA a_; \
+              IFK((r0_) >> 4, 0u) { CPB(b_, p0) CPA(a_, v00) MMA(o0, a_, b_) CPA(a_, v01) MMA(o1, a_, b_) } \
+              IFK((r0_) >> 4, 1u) { CPB(b_, p1) CPA(a_, v10) MMA(o0, a_, b_) CPA(a_, v11) MMA(o1, a_, b_) } \
+              IFK((r0_) >> 4, 2u) { CPB(b_, p2) CPA(a_, v20) MMA(o0, a_, b_) CPA(a_, v21) MMA(o1, a_, b_) } \
+              IFK((r0_) >> 4, 3u) { CPB(b_, p3) CPA(a_, v30) MMA(o0, a_, b_) CPA(a_, v31) MMA(o1, a_, b_) } }
+#else
+#define ATT_OUT(r0_, ca0, ca1) ACC o0 = ACC(0.0), o1 = ACC(0.0); \
             { MB b_; MA a_; \
               IFK((r0_) >> 4, 0u) { CPB(b_, p0) CPA(a_, v00) MMA(o0, a_, b_) CPA(a_, v01) MMA(o1, a_, b_) } \
               IFK((r0_) >> 4, 1u) { CPB(b_, p1) CPA(a_, v10) MMA(o0, a_, b_) CPA(a_, v11) MMA(o1, a_, b_) } \
               IFK((r0_) >> 4, 2u) { CPB(b_, p2) CPA(a_, v20) MMA(o0, a_, b_) CPA(a_, v21) MMA(o1, a_, b_) } \
               IFK((r0_) >> 4, 3u) { CPB(b_, p3) CPA(a_, v30) MMA(o0, a_, b_) CPA(a_, v31) MMA(o1, a_, b_) } \
               MH oh = MH(o0); CPB(b_, oh) MMA(ca0, wo00, b_) MMA(ca1, wo10, b_) \
-              oh = MH(o1); CPB(b_, oh) MMA(ca0, wo01, b_) MMA(ca1, wo11, b_) } }
+              oh = MH(o1); CPB(b_, oh) MMA(ca0, wo01, b_) MMA(ca1, wo11, b_) }
+#endif
         if (lv0) ATT(0u, q00, q01, c00, c01)
         if (lv1) ATT(16u, q10, q11, c10, c11)
         if (lv2) ATT(32u, q20, q21, c20, c21)

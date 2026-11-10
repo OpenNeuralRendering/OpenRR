@@ -404,7 +404,9 @@ int wmain(int argc, wchar_t** argv) {
                 cl[2]->CopyTextureRegion(&tl, 0, 0, 0, &bl, nullptr);
                 tr(hop.res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 tr(buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-                cl[2]->CopyTextureRegion(&bl, 0, 0, 0, &tl, nullptr);
+                // the image's own size: under DRS it is smaller than the hop texture
+                const D3D12_BOX box{0, 0, 0, im.width, im.height, 1};
+                cl[2]->CopyTextureRegion(&bl, 0, 0, 0, &tl, &box);
                 tr(buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                 tr(hop.res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             }
@@ -425,7 +427,7 @@ int wmain(int argc, wchar_t** argv) {
             cl[1]->Close();
         };
         bool d3d_frames = false;
-        // ONR_VALIDATE_SHARPEN=k (D3D12 backend, a hop in rgba32f): the hop's image edited as x + k (x - box3(x)) on the
+        // ONR_VALIDATE_SHARPEN=k (either backend, a hop in rgba32f): the hop's image edited as x + k (x - box3(x)) on the
         // CPU, a stand-in for an NR that follows the jitter (the display mode's stability on a static scene)
         const float sharpen = getenv("ONR_VALIDATE_SHARPEN") ? float(atof(getenv("ONR_VALIDATE_SHARPEN"))) : 0.0f;
         // ONR_VALIDATE_HOP_DUMP=<prefix> (same hop): the image as <prefix><frame>.raw, rgba32f rows, for an NR run outside.
@@ -433,6 +435,68 @@ int wmain(int argc, wchar_t** argv) {
         const char* hop_dump = getenv("ONR_VALIDATE_HOP_DUMP");
         const char* edit_files = getenv("ONR_VALIDATE_EDIT_FILES");
         ID3D12Resource *erb = nullptr, *eup = nullptr;
+        // the image read back, edited on the CPU and written back: an edit that follows the jitter as an NR does
+        auto cpu_edit = [&](const OnrRrDenoisedImage& im, int f) {
+            wait_gpu();
+            auto* buf = static_cast<ID3D12Resource*>(im.buffer);
+            const UINT64 bytes = UINT64(im.row_pitch) * im.height;
+            if (!erb || erb->GetDesc().Width < bytes) {
+                if (erb) erb->Release(), eup->Release();
+                erb = make_buf(bytes, D3D12_HEAP_TYPE_READBACK), eup = make_buf(bytes, D3D12_HEAP_TYPE_UPLOAD);
+            }
+            auto copy = [&](ID3D12Resource* dst, ID3D12Resource* src) {
+                al[2]->Reset();
+                cl[2]->Reset(al[2], nullptr);
+                cl[2]->CopyBufferRegion(dst, 0, src, 0, bytes);
+                cl[2]->Close();
+                ID3D12CommandList* l = cl[2];
+                q->ExecuteCommandLists(1, &l);
+                wait_gpu();
+            };
+            copy(erb, buf);
+            uint8_t *src = nullptr, *dst = nullptr;
+            erb->Map(0, nullptr, reinterpret_cast<void**>(&src));
+            eup->Map(0, nullptr, reinterpret_cast<void**>(&dst));
+            const int W = int(im.width), H = int(im.height);
+            auto px = [&](int x, int y) { return reinterpret_cast<const float*>(src + UINT64(std::clamp(y, 0, H - 1)) * im.row_pitch) + 4 * std::clamp(x, 0, W - 1); };
+            if (hop_dump) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s%04d.raw", hop_dump, f);
+                if (FILE* df = fopen(fn, "wb")) {
+                    for (int y = 0; y < H; ++y) fwrite(src + UINT64(y) * im.row_pitch, 16, size_t(W), df);
+                    fclose(df);
+                }
+            }
+            std::vector<uint16_t> given;
+            if (edit_files) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s%04d.raw", edit_files, f);
+                FILE* ef = fopen(fn, "rb");
+                if (!ef) throw std::runtime_error(std::string("no edit file ") + fn);
+                given.resize(size_t(W) * H * 4);
+                const size_t got = fread(given.data(), 2, given.size(), ef);
+                fclose(ef);
+                if (got != given.size()) throw std::runtime_error(std::string("short edit file ") + fn);
+            }
+            for (int y = 0; y < H; ++y) {
+                float* o = reinterpret_cast<float*>(dst + UINT64(y) * im.row_pitch);
+                for (int x = 0; x < W; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        if (edit_files) {
+                            o[4 * x + c] = h2f(given[(size_t(y) * W + x) * 4 + c]);
+                            continue;
+                        }
+                        float s = 0;
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) s += px(x + dx, y + dy)[c];
+                        const float v = px(x, y)[c];
+                        o[4 * x + c] = c == 3 ? v : std::max(0.0f, v + sharpen * (v - s / 9.0f));
+                    }
+            }
+            erb->Unmap(0, nullptr);
+            eup->Unmap(0, nullptr);
+            copy(buf, eup);
+        };
 
         // guide i of frame f (the scene's rows, its formats) into gs[i]'s rows
         auto to_re9 = [&](int i, const std::vector<uint8_t>& d, int f) {
@@ -693,6 +757,8 @@ int wmain(int argc, wchar_t** argv) {
             auto jit = json_list(js, at, "jitter"), mvs = json_list(js, at, "mv_scale"), rst = json_list(js, at, "reset");
             auto w2v = json_list(js, at, "world_to_view"), v2c = json_list(js, at, "view_to_clip");
             fr.render_width = RW, fr.render_height = RH;
+            // ONR_VALIDATE_DRS=n: every other n frames at 85% of the render size, the guides' top-left corner (DRS within max_render)
+            if (const char* drs = getenv("ONR_VALIDATE_DRS"); drs && (f / std::max(atoi(drs), 1)) & 1) fr.render_width = (RW * 85 / 100) & ~1u, fr.render_height = (RH * 85 / 100) & ~1u;
             fr.jitter_x = float(jit[0]), fr.jitter_y = float(jit[1]);
             fr.mv_scale_x = float(mvs[0]), fr.mv_scale_y = float(mvs[1]);
             for (int i = 0; i < 16; ++i) fr.world_to_view[i] = float(w2v[i]), fr.view_to_clip[i] = float(v2c[i]);
@@ -788,66 +854,7 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 if (solo) {
                 } else if (job && (sharpen > 0 || hop_dump || edit_files) && !half) {
-                    // the image read back, edited here, written back: an edit that follows the jitter as an NR does
-                    wait_gpu();
-                    auto* buf = static_cast<ID3D12Resource*>(im.buffer);
-                    const UINT64 bytes = UINT64(im.row_pitch) * im.height;
-                    if (!erb || erb->GetDesc().Width < bytes) {
-                        if (erb) erb->Release(), eup->Release();
-                        erb = make_buf(bytes, D3D12_HEAP_TYPE_READBACK), eup = make_buf(bytes, D3D12_HEAP_TYPE_UPLOAD);
-                    }
-                    auto copy = [&](ID3D12Resource* dst, ID3D12Resource* src) {
-                        al[2]->Reset();
-                        cl[2]->Reset(al[2], nullptr);
-                        cl[2]->CopyBufferRegion(dst, 0, src, 0, bytes);
-                        cl[2]->Close();
-                        ID3D12CommandList* l = cl[2];
-                        q->ExecuteCommandLists(1, &l);
-                        wait_gpu();
-                    };
-                    copy(erb, buf);
-                    uint8_t *src = nullptr, *dst = nullptr;
-                    erb->Map(0, nullptr, reinterpret_cast<void**>(&src));
-                    eup->Map(0, nullptr, reinterpret_cast<void**>(&dst));
-                    const int W = int(im.width), H = int(im.height);
-                    auto px = [&](int x, int y) { return reinterpret_cast<const float*>(src + UINT64(std::clamp(y, 0, H - 1)) * im.row_pitch) + 4 * std::clamp(x, 0, W - 1); };
-                    if (hop_dump) {
-                        char fn[512];
-                        snprintf(fn, sizeof fn, "%s%04d.raw", hop_dump, f);
-                        if (FILE* df = fopen(fn, "wb")) {
-                            for (int y = 0; y < H; ++y) fwrite(src + UINT64(y) * im.row_pitch, 16, size_t(W), df);
-                            fclose(df);
-                        }
-                    }
-                    std::vector<uint16_t> given;
-                    if (edit_files) {
-                        char fn[512];
-                        snprintf(fn, sizeof fn, "%s%04d.raw", edit_files, f);
-                        FILE* ef = fopen(fn, "rb");
-                        if (!ef) throw std::runtime_error(std::string("no edit file ") + fn);
-                        given.resize(size_t(W) * H * 4);
-                        const size_t got = fread(given.data(), 2, given.size(), ef);
-                        fclose(ef);
-                        if (got != given.size()) throw std::runtime_error(std::string("short edit file ") + fn);
-                    }
-                    for (int y = 0; y < H; ++y) {
-                        float* o = reinterpret_cast<float*>(dst + UINT64(y) * im.row_pitch);
-                        for (int x = 0; x < W; ++x)
-                            for (int c = 0; c < 4; ++c) {
-                                if (edit_files) {
-                                    o[4 * x + c] = h2f(given[(size_t(y) * W + x) * 4 + c]);
-                                    continue;
-                                }
-                                float s = 0;
-                                for (int dy = -1; dy <= 1; ++dy)
-                                    for (int dx = -1; dx <= 1; ++dx) s += px(x + dx, y + dy)[c];
-                                const float v = px(x, y)[c];
-                                o[4 * x + c] = c == 3 ? v : std::max(0.0f, v + sharpen * (v - s / 9.0f));
-                            }
-                    }
-                    erb->Unmap(0, nullptr);
-                    eup->Unmap(0, nullptr);
-                    copy(buf, eup);
+                    cpu_edit(im, f);
                 } else if (job) {
                     ID3D12CommandList* h = cl[2];
                     q->ExecuteCommandLists(1, &h);
@@ -924,8 +931,12 @@ int wmain(int argc, wchar_t** argv) {
                     throw std::runtime_error(std::string("EnqueueNetwork: ") + err);
                 }
                 if (exported && im.buffer) {
-                    ID3D12CommandList* h = cl[2];
-                    q->ExecuteCommandLists(1, &h);
+                    if ((sharpen > 0 || hop_dump || edit_files) && !half) {
+                        cpu_edit(im, f);   // the queue waits for the network (EnqueueNetwork), so the image is there
+                    } else {
+                        ID3D12CommandList* h = cl[2];
+                        q->ExecuteCommandLists(1, &h);
+                    }
                     format = im.format;
                 }
                 if (a2.EnqueuePost(ctx, job, q, format)) {

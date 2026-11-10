@@ -386,6 +386,7 @@ struct Ctx {
     bool lite_logged = false;
     std::atomic<bool> built{false};
     std::atomic<bool> building{false};
+    std::atomic<bool> quit{false};    // Destroy: the builders stop at the next kernel
     std::thread builder;
     Weights w;
     std::atomic<bool> weights_ok{false};
@@ -485,6 +486,14 @@ void load_flow(Kernels& k, Gpu& d, const std::wstring& dir) {
 
 void build_lite(Ctx* c);
 
+// one kernel at a time, so a Destroy during the build waits for one pipeline, not for all of them
+void load_each(Ctx* c, Kernels& k, Gpu& d, const std::vector<std::string>& names, bool lite = false) {
+    for (const auto& n : names) {
+        if (c->quit) throw std::runtime_error("destroyed while building");
+        lite ? k.load_lite(d, utf8(c->shader_dir), {n}) : k.load(d, utf8(c->shader_dir), {n});
+    }
+}
+
 void build_network(Ctx* c) {
     try {
         if (!c->weights_ok) {
@@ -528,7 +537,7 @@ void build_network(Ctx* c) {
             }
         }
         if (!c->use_d3d) {
-            k.load(c->dev, utf8(c->shader_dir), names);
+            load_each(c, k, c->dev, names);
             if (c->vk_host && c->direct_ok) {
                 try {
                     k.load(c->dev, utf8(c->shader_dir), {"d3d_downsample", "d3d_downsample_tl"});
@@ -561,7 +570,7 @@ void build_lite(Ctx* c) {
     auto t0 = std::chrono::steady_clock::now();
     try {
         const uint32_t h0 = c->use_d3d ? c->dx->cache_hits() : 0, m0 = c->use_d3d ? c->dx->cache_misses() : 0;
-        c->net_lite.load_lite(d, utf8(c->shader_dir), c->net.names());
+        load_each(c, c->net_lite, d, c->net.names(), true);
         if (c->net_lite.names().empty()) throw std::runtime_error("no *_lt kernels in the shader folder");
         g_log("fast mode kernels ready (%zu pipelines: %u ELFs from the cache, %u built) in %.2f s", c->net_lite.names().size(),
               c->use_d3d ? c->dx->cache_hits() - h0 : 0, c->use_d3d ? c->dx->cache_misses() - m0 : 0,
@@ -1140,6 +1149,10 @@ std::vector<Retired> g_retired;
 void destroy_ctx(Ctx* c) {
     --g_live;
     if (c->vk_host && c->dev.vk()) {
+        // the builders make pipelines on the game's device, which the game may destroy as soon as this returns
+        c->quit = true;
+        if (c->builder.joinable()) c->builder.join();
+        if (c->lite_builder.joinable()) c->lite_builder.join();
         std::lock_guard l(g_retired_m);
         g_retired.push_back({c->dev.vk(), c, 0});
         return;

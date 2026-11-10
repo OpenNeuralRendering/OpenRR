@@ -193,6 +193,8 @@ private:
     // driver lays them out otherwise
     Image hist_img_[2];
     VkSampler hist_smp_ = VK_NULL_HANDLE;
+    size_t fast_layout(I2 pad, size_t rp, size_t ip, uint64_t base);
+    Buffer arena_;   // fast mode: the frame-scoped buffers (fast_layout)
     Buffer attr_, img_, ero_, nond_, pmv2_[2], hidden_[2], down_[2], hist_[2], expo_[2];
     Buffer pdst_, acc_, blk_, tile_, fix_, frg_, fb_, ajab_, mvf_, aniso_, prm_;
     Buffer attr_wide_;   // the 64-byte record (enc0_attr_f_w), made on the first frame that needs it

@@ -5,7 +5,7 @@ cards (RDNA4), with kernels written from scratch. It is the Ray Reconstruction r
 inside the [OpenNR OptiScaler fork](https://github.com/MatheusFerreiraS/OpenNR-OptiScaler): when a game asks for DLSS
 Ray Reconstruction, OptiScaler hands the frame to OpenRR.
 
-Version 0.1.3. MIT licence.
+Version 0.1.4. MIT licence.
 
 Discord: <https://discord.gg/wYhvS3JSHM>
 
