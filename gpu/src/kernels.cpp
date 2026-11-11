@@ -26,9 +26,9 @@ void Kernels::load(Gpu& dev, const std::string& dir, const std::vector<std::stri
         if (!k_.count(n)) k_[n] = dev.load((std::filesystem::path(dir) / (n + ".spv")).string(), subgroup_of(n));
 }
 
-void Kernels::load_lite(Gpu& dev, const std::string& dir, const std::vector<std::string>& names) {
+void Kernels::load_lite(Gpu& dev, const std::string& dir, const std::vector<std::string>& names, const char* suffix) {
     for (auto& n : names) {
-        auto p = std::filesystem::path(dir) / (n + "_lt.spv");
+        auto p = std::filesystem::path(dir) / (n + suffix + ".spv");
         if (!k_.count(n) && std::filesystem::exists(p)) k_[n] = dev.load(p.string(), subgroup_of(n));
     }
 }

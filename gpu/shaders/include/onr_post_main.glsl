@@ -19,6 +19,9 @@
 #include "onr_filter.glsl"
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_quad : require
+#ifdef LT_POST_STILL
+#extension GL_KHR_shader_subgroup_vote : require
+#endif
 layout(local_size_x = 256) in;
 
 layout(push_constant, scalar) uniform P {
@@ -115,13 +118,24 @@ vec3 bicubic_hist(float px, float py) {
     int i = int(bx - 0.5), j = int(by - 0.5);
     vec3 T0, T1, T2, T3, T4;
 #ifdef POST_PLAIN
+#ifdef LT_POST_HW
+    // this build is only launched with the history on the sampler (Engine::record_post): no hand blend in it
+    {
+#else
     if ((pc.reset & 16u) != 0u) {
+#endif
+#ifdef LT_POST_STILL
+        // a still image: every lane of the wave on a texel centre, where the weights are 0, 1, 0 on both axes and the
+        // five taps come to the middle one, which is that texel
+        if (subgroupAll(ix == 0 && iy == 0)) return hist_hw(bx, by);
+#endif
         // the taps on the sampler: the outer ones at texel centres across, the middle one at (xm, ym)
         float xq = float(fixed8_coord(xm, pc.size.x)) * (1.0 / 256.0) + 0.5, yq = float(fixed8_coord(ym, pc.size.y)) * (1.0 / 256.0) + 0.5;
         float xl = float(i - 1) + 0.5, xr = float(i + 2) + 0.5, yt = float(j - 1) + 0.5, yb = float(j + 2) + 0.5;
         return bicubic_sum(tx, ty, hist_hw(xl, yq), hist_hw(xq, yt), hist_hw(xq, yq), hist_hw(xq, yb), hist_hw(xr, yq));
     }
 #endif
+#ifndef LT_POST_HW
     {
     ivec3 axm = axis_setup(xm, pc.size.x), aym = axis_setup(ym, pc.size.y);
     ivec3 axl = ivec3(clamp(i - 1, 0, pc.size.x - 1), 0, 0), axr = ivec3(clamp(i + 2, 0, pc.size.x - 1), 0, 0);
@@ -133,6 +147,7 @@ vec3 bicubic_hist(float px, float py) {
     T4 = TAP(axr, aym, hist_texel(axr.x, aym.x), vec3(0.0), hist_texel(axr.x, aym.y), vec3(0.0));
     return bicubic_sum(tx, ty, T0, T1, T2, T3, T4);
     }
+#endif
 }
 #ifdef POST_DELTA
 // A log delta in 32 bits: per channel the sign, a 4-bit exponent (2^-13 .. 2^2) and 6 / 6 / 5 mantissa bits (R, G, B),
@@ -204,6 +219,9 @@ void dh_catrom_pair(float px, float py) {
 #endif
 
 struct Cand { float f, mx, my; };
+#ifdef LT_POST_EXPO
+float g_e0, g_e1, g_e2;   // the exposures, read before any store of the thread: a scalar load, not a vector load per pixel
+#endif
 
 void sw(inout Cand p, inout Cand q) {
     if (!(p.f >= q.f)) { Cand t = p; p = q; q = t; }
@@ -228,6 +246,42 @@ f16vec2 lt_exp2(f16vec2 e) {
 }
 #endif
 
+#ifdef LT_POST_LDS
+// The tile texels of the workgroup in shared memory, each read once from the buffer: a pair reads 16 of them, the same few
+// for all the group's threads. Rows of 16, clamped texel (x, y) at (y - ls_o.y) * 16 + x - ls_o.x; at most 16 x 26 (render /
+// internal up to 2/3).
+shared f16vec4 ls_t[832];
+#ifdef POST_DELTA
+shared f16vec4 ls_n[416];
+#else
+shared f16vec2 ls_n[416];
+#endif
+ivec2 ls_o;
+void ls_fill(ivec2 g) {
+    uint li = gl_LocalInvocationIndex;
+    // the group's first and last pair, with main()'s own expressions for their positions (the same roundings)
+    precise float ax = fma(float(g.x) + 0.5, pc.scale.x, pc.offset.x), ay = fma(pc.scale.y, float(g.y) + 0.5, pc.offset.y);
+    precise float bx = fma(float(g.x + 15) + 0.5, pc.scale.x, pc.offset.x), by = fma(pc.scale.y, float(g.y + 30) + 0.5, pc.offset.y);
+    ivec2 a = ivec2(int(floor(ax - 0.5)), int(floor(ay - 0.5))) - 1;
+    ivec2 b = ivec2(int(floor(bx - 0.5)), int(floor(by - 0.5))) + 2;
+    ls_o = clamp(a, ivec2(0), pc.lr_size - 1);
+    ivec2 e = clamp(b, ivec2(0), pc.lr_size - 1) - ls_o;
+    int x = int(li & 15u);
+    if (x <= e.x)
+        for (int r = int(li >> 4); r <= e.y; r += 16) {
+            uint q = uint(r * 16 + x);
+            F16x4Buf tb = AT32(F16x4Buf, pc.tile, (ls_o.y + r) * pc.lr_size.x + ls_o.x + x, 24u);
+            ls_t[2u * q] = tb.v[0], ls_t[2u * q + 1u] = tb.v[1];
+#ifdef POST_DELTA
+            ls_n[q] = tb.v[2];
+#else
+            ls_n[q] = tb.v[2].xy;
+#endif
+        }
+    barrier();
+}
+#endif
+
 void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s1) {
     int r8 = int(floor(fx - 0.5));
     int ry0 = int(floor(fy0 - 0.5)), ry1 = int(floor(fy1 - 0.5));
@@ -244,6 +298,9 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
     precise f16vec3 x0 = f16vec3(0.0hf), x1 = f16vec3(0.0hf);
 #endif
     precise float w0 = 0.0, w1 = 0.0;
+#ifdef LT_POST_W16
+    precise f16vec2 wp = f16vec2(0.0hf);
+#endif
     for (int k = -1; k <= 2; ++k) {
         precise float16_t dxk = dx0 + float16_t(k);
         precise float16_t dx2 = dxk * dxk;
@@ -253,6 +310,17 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
             if ((k == -1 || k == 2) && (j == -1 || j == 2)) continue;
 #endif
             int cy = clamp(base + j, 0, pc.lr_size.y - 1);
+#ifdef LT_POST_LDS
+            uint q = uint((cy - ls_o.y) * 16 + cx - ls_o.x);
+            f16vec4 c = ls_t[2u * q], a = ls_t[2u * q + 1u];
+#ifdef POST_DELTA
+            f16vec4 t2 = ls_n[q];
+            f16vec2 n = t2.xy;
+            f16vec3 ed = f16vec3(a.z, t2.z, t2.w);
+#else
+            f16vec2 n = ls_n[q];
+#endif
+#else
             F16x4Buf tb = AT32(F16x4Buf, pc.tile, cy * pc.lr_size.x + cx, 24u);
             f16vec4 c = tb.v[0], a = tb.v[1];
 #ifdef POST_DELTA
@@ -262,6 +330,7 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
 #else
             f16vec2 n = tb.v[2].xy;
 #endif
+#endif
             // the two pixels' exponents in one packed chain (x: upper pixel, y: lower)
             precise f16vec2 dyj = f16vec2(dy0, dy1) + float16_t(j);
             precise f16vec2 dy2 = dyj * dyj;
@@ -269,7 +338,9 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
             precise f16vec2 e = fma(dy2, f16vec2(n.x), f16vec2(e0));
             precise f16vec2 dxy = dxk * dyj;
             e = fma(dxy, f16vec2(n.y), e);
-#ifdef LT_POST_EXP
+#ifdef LT_POST_W16
+            float16_t w = exp2(e.x), v = exp2(e.y);
+#elif defined(LT_POST_EXP)
             f16vec2 wv = lt_exp2(e);
             float16_t w = wv.x, v = wv.y;
             float w32 = float(w), v32 = float(v);
@@ -282,8 +353,12 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
             x0 = fma(f16vec3(w), ed, x0);
 #endif
             a0 = fma(f16vec2(w), a.xy, a0);
+#ifdef LT_POST_W16
+            wp = wp + f16vec2(w, v);
+#else
             w0 = w0 + w32;
-#ifndef LT_POST_EXP
+#endif
+#if !defined(LT_POST_EXP) && !defined(LT_POST_W16)
             float v32 = exp2(float(e.y));
             float16_t v = float16_t(v32);
 #endif
@@ -292,9 +367,14 @@ void splat_pair(int X, float fx, float fy0, float fy1, out Splat s0, out Splat s
             x1 = fma(f16vec3(v), ed, x1);
 #endif
             a1 = fma(f16vec2(v), a.xy, a1);
+#ifndef LT_POST_W16
             w1 = w1 + v32;
+#endif
         }
     }
+#ifdef LT_POST_W16
+    w0 = float(wp.x), w1 = float(wp.y);
+#endif
 #ifdef POST_DELTA
     s0 = Splat(c0.xyz, f16vec3(c0.w, a0), w0, x0);
     s1 = Splat(c1.xyz, f16vec3(c1.w, a1), w1, x1);
@@ -389,7 +469,11 @@ void pixel(int X, int Y, float fx, float fy, Splat sp, out vec3 out1, out vec3 o
     float wsum = sp.w;
 
     // ---- stage 2: network colour
+#ifdef LT_POST_EXPO
+    float e0 = g_e0, e1 = g_e1, e2 = g_e2;
+#else
     float e0 = pc.exposure.v[0], e1 = pc.exposure.v[1], e2 = pc.exposure.v[2];
+#endif
     precise float lu = fx * pc.lr_inv_size.x;
     precise float lv = fy * pc.lr_inv_size.y;
     int lx = int(floor(fx)), ly = int(floor(fy));    float inv_w = rcp_rn(max(wsum, EPS10));
@@ -552,6 +636,9 @@ void main() {
     // horizontally adjacent pairs, so the DownsampledHistory 2x2 mean is (top + bottom) in the thread,
     // then one quad swap for the column sum, the reference's order.
     uint li = gl_LocalInvocationIndex;
+#ifdef LT_POST_EXPO
+    g_e0 = pc.exposure.v[0], g_e1 = pc.exposure.v[1], g_e2 = pc.exposure.v[2];
+#endif
 #ifdef POST_FIXUP
     uint item = gl_WorkGroupID.x * 128u + (li >> 1);
     if (item >= pc.fix.v[3]) return;
@@ -570,6 +657,9 @@ void main() {
     precise float fx = fma(float(X) + 0.5, pc.scale.x, pc.offset.x);
     precise float fy0 = fma(pc.scale.y, float(Y0) + 0.5, pc.offset.y);
     precise float fy1 = fma(pc.scale.y, float(Y0 + 1) + 0.5, pc.offset.y);
+#ifdef LT_POST_LDS
+    ls_fill(pc.origin + tile);
+#endif
     Splat s0, s1;
     if (v0) splat_pair(X, fx, fy0, fy1, s0, s1);
 #ifdef LT_POST_PAIR

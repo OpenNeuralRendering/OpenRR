@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -279,9 +281,19 @@ void Engine::upload_stage(const StageWeights& s, StageBufs& b) {
     U(b.bias, s.b.bias);
     U(b.dfn_w, s.dfn_w);
     U(b.dfn_b, s.dfn_b);
-    U(b.mrg_w, s.Co && s.mrg_w.size() == size_t(s.Co) * 4 * s.b.C ? with_tiles(s.mrg_w, 4 * s.b.C) : s.mrg_w);
+    // the enc1 buffer (its input merge after the merge) and up_w at C <= 64: their e4m3 codes after the fp16 values, for the
+    // fast mode's LT_MI8 / LT_UP8 products (the regular kernels never read past the fp16)
+    auto U8 = [&](Buffer& dst, const H16& v) {
+        if (v.empty()) { dst = {}; return; }
+        auto d = qv_bytes(v.data(), v.size());
+        pack_bytes(dev_, fixed_, d.data(), d.size(), &dst);
+    };
+    if (s.Co && s.mrg_w.size() == size_t(s.Co) * 4 * s.b.C) U(b.mrg_w, with_tiles(s.mrg_w, 4 * s.b.C));
+    else if (s.Co) U8(b.mrg_w, s.mrg_w);
+    else U(b.mrg_w, s.mrg_w);
     U(b.mrg_b, s.mrg_b);
-    U(b.up_w, s.up_w);
+    if (s.b.C <= 64) U8(b.up_w, s.up_w);
+    else U(b.up_w, s.up_w);
     U(b.up_b, s.up_b);
 }
 
@@ -314,6 +326,20 @@ void Engine::init(Gpu& dev, const Kernels& k, const Weights& w) {
     flow_ = dev.create(10 * 512 * 4), fixed_.push_back(flow_);
     gtab_ = dev.create(sizeof(GuideTable)), fixed_.push_back(gtab_);
     hist_smp_ = dev.sampler(true, true);
+    // the fast mode's deep levels (set_deep): gpu/fastmode.cmake's LT_ENGINE_DEEP, or ONR_RR_DEEP=mode,level,period,guard
+    // (measurements; 0 turns it off)
+    const char* e = getenv("ONR_RR_DEEP");
+    deep_on_ = e != nullptr;
+#ifdef ONR_LT_DEEP
+    if (!e) e = ONR_LT_DEEP;
+#endif
+    if (e && *e) {
+        int m = 0, l = 4, p = 2, g = 0;
+        sscanf(e, "%d,%d,%d,%d", &m, &l, &p, &g);
+        if (m >= 0 && m <= 3 && l >= 3 && l <= 5 && p >= 1) set_deep(m, l, p, g);
+        deep_pair_ = !getenv("ONR_RR_DEEP_SERIAL");
+        if (const char* q = getenv("ONR_RR_DEEP_PART")) deep_part_ = atoi(q), deep_pair_ = false;
+    }
 }
 
 void Engine::drop_display_history() {
@@ -426,6 +452,7 @@ void Engine::resize(I2 render, I2 output, I2 max_render) {
         tl_last_ = to_last_ = false;
     }
     render_ = render, output_ = output;
+    deep_wrote_ = deep_wb_[0] = deep_wb_[1] = ~0ull;
     internal_ = {output.x * 3 / 2, output.y * 3 / 2};
     ds_ = half_up(internal_), ds2_ = half_up(ds_);
     pad_ = {(render.x + 31) & ~31, (render.y + 31) & ~31};
@@ -474,6 +501,7 @@ void Engine::resize(I2 render, I2 output, I2 max_render) {
         }
         prm_ = S(kBlockBytes + 64);
         attr_wide_ = {};
+        for (int i = 0; i < 2; ++i) deep_t_[i] = deep_d_[i] = {};
         if (out_changed || !hist_[0].addr) {
             for (auto& i : hist_img_) dev_->destroy(i);
             for (auto& h : hist_)
@@ -534,10 +562,58 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
     // 240 window rows (onr_flow.glsl FLOW_ROWS; the shifts add at most one)
     bool flow = flow_on_ && fast_ && (pad_.y >> 2) / 8 + 1 <= 240;
     for (const auto& n : flow_kernel_names()) flow = flow && K.has(n);
-    if (flow) d.fill(flow_, 0, 10 * 512 * 4, 0);
+    // the deep levels from an earlier frame (set_deep): reuse skips them this frame, late reads the previous frame's
+    const int DL = deep_level_;
+    bool reuse = false, late = false;
+    int dw = 0, dr = 0;
+    if (frame_lite_ && deep_on_ && deep_mode_) {
+        if (!deep_t_[0].addr) {
+            const I2 z = shr({(alloc_render_.x + 31) & ~31, (alloc_render_.y + 31) & ~31}, DL);
+            const size_t px = size_t(z.x) * z.y;
+            for (int i = 0; i < (deep_mode_ >= 2 ? 2 : 1); ++i)
+                deep_t_[i] = dev_->create(px * (DL == 5 ? W.enc[5].b.C : W.dec1[DL].b.C) + 64), deep_d_[i] = dev_->create(px * 8 + 64), sized_.push_back(deep_t_[i]), sized_.push_back(deep_d_[i]);
+            deep_wrote_ = deep_wb_[0] = deep_wb_[1] = ~0ull;
+        }
+        if (reset) deep_since_ = 0;
+        const bool can = deep_wrote_ != ~0ull && !reset && deep_since_ >= uint64_t(deep_guard_);
+        if (deep_mode_ == 1) {
+            reuse = can && frame_ - deep_wrote_ < uint64_t(deep_period_);
+        } else if (deep_mode_ == 2) {
+            late = can && frame_ - deep_wrote_ == 1, dw = cur, dr = late ? old : cur;
+        } else {
+            // two frames run, then each of the next two reads the one two frames before it (same window shifts)
+            dw = dr = cur;
+            reuse = !reset && deep_since_ >= uint64_t(deep_guard_) && ((frame_ >> 1) & 1) && deep_wb_[cur] == frame_ - 2;
+            if (!reuse) deep_wb_[cur] = frame_;
+        }
+        ++deep_since_;
+        if (!reuse) deep_wrote_ = frame_;
+        if (late) flow = false;   // (measurements: the regrouped order has no row flags yet)
+    }
+    // measurements (ONR_RR_DEEP_PART): only the tensor (1) or only the DFN image (2) read from the earlier frame
+    const int drt = deep_part_ == 2 ? dw : dr, drd = deep_part_ == 1 ? dw : dr;
+    if (flow && reuse) {
+        // a skipped level's row flags read as done: the first decoder kernel that runs waits on the slot before it
+        // (three fills that do not overlap: nothing orders them)
+        const size_t sl = size_t(DL == 5 ? 3 : DL == 4 ? 5 : 7) * 512 * 4;
+        d.fill(flow_, 0, sl, 0);
+        d.fill(flow_, sl, 512 * 4, 1);
+        d.fill(flow_, sl + 512 * 4, 10 * 512 * 4 - sl - 512 * 4, 0);
+    } else if (flow) {
+        d.fill(flow_, 0, 10 * 512 * 4, 0);
+    }
 
     // launches 0 and 1: DownsampledHistory2 and the exposure (one dispatch; its last block leaves acc_ at +0)
-    if (!fresh_) (frame_lite_ && lk_->has("pooled_history2") ? *lk_ : K).pooled_history2(d, PooledHistory2PC{down_[old].addr, pdst_.addr, ds_, ds2_});
+#ifdef ONR_LT_NODS2
+    // the mode's enc0_attr reads DownsampledHistory where the other reads DownsampledHistory2 (LT_ATTR_NODS2 in
+    // fastmode.cmake): a frame on that kernel does not need the pooling
+    const std::string an = dg ? "d3d_enc0_attr_f" : "enc0_attr_f";
+    const bool an_w = (f.depth_of_field || f.responsivity) && K.has(an + "_w") && K.has("enc0_stage_32_64_f_w");
+    const bool ds2 = !(frame_lite_ && lk_->has(an + (an_w ? "_w" : "")));
+#else
+    const bool ds2 = true;
+#endif
+    if (!fresh_ && ds2) (frame_lite_ && lk_->has("pooled_history2") ? *lk_ : K).pooled_history2(d, PooledHistory2PC{down_[old].addr, pdst_.addr, ds_, ds2_});
     AePC ae{dg ? gtab_.addr : g.color, acc_.addr, f.render, {0, 0}, {f.render.x - 1, f.render.y - 1}, expo_[cur].addr, expo_[old].addr, blk_.addr,
             float(1.0 / (429496.71875 * double(f.render.x) * double(f.render.y))), reset ? 1u : 0u,
             uint32_t(div_up(f.render.x, 16) * div_up(f.render.y, 16))};
@@ -588,7 +664,8 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
         d.barrier();
     }
     // enc1..enc5
-    for (int s = 1; s <= 5; ++s) {
+    const bool deep = frame_lite_ && deep_on_ && deep_mode_;
+    auto enc_k = [&](int s, bool fl) {
         const StageWeights& sw = W.enc[s];
         const StageBufs& b = enc_[s];
         const Level& lo = enc_l_[s - 1];
@@ -596,25 +673,25 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
         EncStagePC p{block_pc(sw, b, x, enc_l_[s].tensor.addr, shr(pad_, s), s == 5 ? sh_a : sh_enc), b.dfn_w.addr, b.dfn_b.addr,
                      b.mrg_w.addr, b.mrg_b.addr, lo.dfn_pool.addr, enc_l_[s].dfn.addr, enc_l_[s].dfn_pool.addr, enc_l_[s].pooled.addr,
                      sw.s_dfn, s == 1 ? pad_ : I2{}};
-        const bool fl = flow && s >= 2;
         if (fl) p.b.mask = flow_.addr;
+        if (deep && DL == 5 && s == 5) p.b.y = deep_t_[dw].addr, p.dfn_out = deep_d_[dw].addr;
         run(d, "enc_stage_" + dims(sw.b) + "_" + std::to_string(sw.Co) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
-        if (!fl) d.barrier();
-    }
-    // dec4..dec0
-    uint64_t bt = enc_l_[5].tensor.addr, bd = enc_l_[5].dfn.addr;
-    for (int l = 4; l >= 0; --l) {
+    };
+    // decN_0 over the tensor bt of the level below, decN_1 over its DFN image bd
+    auto up_k = [&](int l, bool fl, uint64_t bt) {
         I2 z = shr(pad_, l);
-        const StageWeights &s0 = W.dec0[l], &s1 = W.dec1[l];
+        const StageWeights& s0 = W.dec0[l];
         DecUpPC u{block_pc(s0, dec0_[l], enc_l_[l].tensor.addr, dec0_l_[l].tensor.addr, z, sh_a), bt, dec0_[l].up_w.addr,
                   dec0_[l].up_b.addr, shr(z, 1), s0.s98, 0};
         // dec0_1 reads the rows of its windows below out_h; the dec0_0 windows past them are skipped
         const int lh = 8 * ((f.render.y + sh_b.y + 7) / 8) - sh_b.y;
         if (!l && lh < z.y) u.live_h = lh;
-        const bool fl = flow && l >= 2;
         if (fl) u.b.mask = flow_.addr;
         run(d, "dec_up_" + dims(s0.b) + "_" + std::to_string(s0.Cp) + (fl ? "_fl" : fx), &u, sizeof u, windows(u.b));
-        if (!fl) d.barrier();
+    };
+    auto dfn_k = [&](int l, bool fl, uint64_t bd) {
+        I2 z = shr(pad_, l);
+        const StageWeights& s1 = W.dec1[l];
         DecDfnPC p{};
         p.b = block_pc(s1, dec1_[l], dec0_l_[l].tensor.addr, l ? dec1_l_[l].tensor.addr : 0, z, sh_b);
         p.dfn_w = dec1_[l].dfn_w.addr, p.dfn_b = dec1_[l].dfn_b.addr;
@@ -631,10 +708,53 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
             if (fast_ && p.tile && !dfn_out) p.dfn_out = 0;
         }
         if (fl) p.b.mask = flow_.addr;
+        if (deep && l == DL) p.b.y = deep_t_[dw].addr, p.dfn_out = deep_d_[dw].addr;
         run(d, (l ? "dec_dfn_" : "dec_head_") + dims(s1.b) + (fl ? "_fl" : fx), &p, sizeof p, windows(p.b));
+    };
+    int l_next = 4;
+    uint64_t bt = enc_l_[5].tensor.addr, bd = enc_l_[5].dfn.addr;
+    if (late && DL == 4 && deep_pair_) {
+        // the deep levels beside the two decoder levels above them, which read the previous frame's level 4: no kernel of
+        // a pair reads what the other writes, so each pair runs without a barrier inside (the deep one launched first)
+        for (int s = 1; s <= 3; ++s) enc_k(s, false), d.barrier();
+        enc_k(4, false), up_k(3, false, deep_t_[dr].addr), d.barrier();
+        enc_k(5, false), dfn_k(3, false, deep_d_[dr].addr), d.barrier();
+        up_k(4, false, bt), up_k(2, false, dec1_l_[3].tensor.addr), d.barrier();
+        dfn_k(4, false, bd), dfn_k(2, false, dec1_l_[3].dfn.addr), d.barrier();
+        bt = dec1_l_[2].tensor.addr, bd = dec1_l_[2].dfn.addr;
+        l_next = 1;
+    } else if (late && DL == 5 && deep_pair_) {
+        // enc5 beside dec4_0, which reads the previous frame's enc5 (dec4_1 too)
+        for (int s = 1; s <= 4; ++s) enc_k(s, false), d.barrier();
+        enc_k(5, false), up_k(4, false, deep_t_[dr].addr), d.barrier();
+        dfn_k(4, false, deep_d_[dr].addr), d.barrier();
+        bt = dec1_l_[4].tensor.addr, bd = dec1_l_[4].dfn.addr;
+        l_next = 3;
+        flow = false;
+    } else {
+        for (int s = 1; s <= 5; ++s) {
+            if (reuse && s >= DL) break;
+            const bool fl = flow && s >= 2;
+            enc_k(s, fl);
+            // before a skipped level the decoder no longer waits for this one through the levels between: a barrier
+            if (!fl || (reuse && s == DL - 1)) d.barrier();
+        }
+        if (deep && DL == 5) bt = deep_t_[drt].addr, bd = deep_d_[drd].addr;
+    }
+    // dec4..dec0
+    for (int l = l_next; l >= 0; --l) {
+        if (reuse && l >= DL) {
+            if (l == DL) bt = deep_t_[dr].addr, bd = deep_d_[dr].addr;
+            continue;
+        }
+        const bool fl = flow && l >= 2;
+        up_k(l, fl, bt);
+        if (!fl) d.barrier();
+        dfn_k(l, fl, bd);
         // dec2_1 ends the flow: everything after it reads behind a barrier
         if (!(fl && l >= 3)) d.barrier();
         bt = dec1_l_[l].tensor.addr, bd = dec1_l_[l].dfn.addr;
+        if (deep && l == DL) bt = deep_t_[drt].addr, bd = deep_d_[drd].addr;
     }
     if (dfn_out) {
         DfnExportPC e{dec1_l_[0].dfn.addr, blk_.addr, dfn_out, f.render, pad_.x, dfn_pitch, dfn_half ? 1u : 0u};
@@ -677,6 +797,9 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
     pp.reset = reset ? 1u : 0u;
     // fast post: the history taps on the sampler (the same values as its hand blend)
     if (fast_ && sampler_ && hist_img_[0].img && hist_img_[1].img) pp.reset |= 16u | uint32_t(old) << 5;
+    // the mode's post has no hand blend of the history (LT_POST_HW) and keeps its group's tile texels in 16 x 26 of
+    // shared memory (LT_POST_LDS: render up to 2/3 of internal, DLAA): without the sampler or above that, the other post
+    const bool lite_post = frame_lite_ && (pp.reset & 16u) != 0u && f.render.x * 3 <= internal_.x * 2 && f.render.y * 3 <= internal_.y * 2;
     // display: the edit as a log delta over the network's display blend, with a history of its own; a frame without
     // an edit carries that history over
     if (edit == DfnEdit::display && !display_history()) {
@@ -688,10 +811,10 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
         PostDltPC pn{pp, dh_[old].addr, dh_[cur].addr, dh_alpha_};
         if (nr_frame_ == ~0ull || nr_frame_ + 1 != frame_) pn.p.reset |= 4u;
         if (edit == DfnEdit::none) pn.p.reset |= 8u;
-        (frame_lite_ && lk_->has("post_dlt_f") ? *lk_ : K).post_dlt(d, pn, fix_, fast_);
+        (lite_post && lk_->has("post_dlt_f") ? *lk_ : K).post_dlt(d, pn, fix_, fast_);
         nr_frame_ = frame_;
     } else {
-        (frame_lite_ && lk_->has("post_f") ? *lk_ : K).post(d, pp, fix_, fast_);
+        (lite_post && lk_->has("post_f") ? *lk_ : K).post(d, pp, fix_, fast_);
     }
     d.barrier();
     const DownsamplePC ds{frg_.addr, fb_.addr, out, blk_.addr, internal_, f.output, {0, 0}, f.output, internal_, {0, internal_.x}};

@@ -5,7 +5,7 @@ cards (RDNA4), with kernels written from scratch. It is the Ray Reconstruction r
 inside the [OpenNR OptiScaler fork](https://github.com/MatheusFerreiraS/OpenNR-OptiScaler): when a game asks for DLSS
 Ray Reconstruction, OptiScaler hands the frame to OpenRR.
 
-Version 0.1.4. MIT licence.
+Version 0.1.5. MIT licence.
 
 Discord: <https://discord.gg/wYhvS3JSHM>
 
@@ -35,15 +35,17 @@ In game, OpenRR settings are in OptiScaler's `[OpenNR-RR]` section and in the up
   own and added to the displayed image, so the network's own history stays clean. In Vulkan games NR on OpenRR doesn't
   run yet.
 
-Two modes, picked in the menu or with `Mode` in `[OpenNR-RR]`, which flip live:
+Three modes, picked in the menu or with `Mode` in `[OpenNR-RR]` (`new`, `fast`, `legacy`), which flip live:
 
-| | Quality 1080p | DLAA 1080p | Against NVIDIA's own (RTX card) |
+| | Performance 1080p | Quality 1080p | Against NVIDIA's own (RTX card) |
 |---|---|---|---|
-| **New** (default): cheaper kernels | about 3.05 ms | about 6.2 ms | about 60.5 dB on the display |
-| **Legacy**: the kernels closest to NVIDIA's | about 3.33 ms | about 6.8 ms | about 63 dB on the display |
+| **New** (default): cheaper kernels | about 2.0 ms | about 2.9 ms | about 60.8 dB on the display |
+| **Fast (experimental)**: New with more cut, and the network's deepest levels read from the previous frame | about 1.8 ms | about 2.75 ms | about 55 dB on the display |
+| **Legacy**: the kernels closest to NVIDIA's | about 2.2 ms | about 3.27 ms | about 63 dB on the display |
 
-Measured on an RX 9070 XT, outside a game. The first start builds New's kernels in the background, with the image on
-Legacy until they're ready.
+Measured on an RX 9070 XT, outside a game. The first start builds the kernels of New and Fast in the background, with the
+image on Legacy until they're ready. Fast changes more from frame to frame in motion and on very bright points: look at
+those before keeping it.
 
 Tested in Cyberpunk 2077, Resident Evil Requiem, Hogwarts Legacy and Neverness to Everness (D3D12), and Indiana Jones
 and the Great Circle (Vulkan). DOOM: The Dark Ages is not supported: its menu hides DLSS on AMD GPUs.

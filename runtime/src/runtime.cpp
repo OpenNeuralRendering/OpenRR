@@ -380,7 +380,9 @@ struct Ctx {
     Kernels kern;                    // ingest, pack
     Kernels net;                      // the fast network (*_f); published by `built`
     // the user's "Fast mode": the cheaper kernels (*_lt, Engine::set_lite), built once it is asked for
-    Kernels net_lite;
+    Kernels net_lite, net_lx;   // net_lx: the experimental level, its _lx kernels and the mode's for the rest
+    std::atomic<bool> lx_want{false};
+    int lx_logged = -1;
     std::atomic<bool> lite_want{false}, lite_started{false}, lite_built{false}, lite_failed{false};
     std::thread lite_builder;
     bool lite_logged = false;
@@ -487,10 +489,10 @@ void load_flow(Kernels& k, Gpu& d, const std::wstring& dir) {
 void build_lite(Ctx* c);
 
 // one kernel at a time, so a Destroy during the build waits for one pipeline, not for all of them
-void load_each(Ctx* c, Kernels& k, Gpu& d, const std::vector<std::string>& names, bool lite = false) {
+void load_each(Ctx* c, Kernels& k, Gpu& d, const std::vector<std::string>& names, const char* lite = nullptr) {
     for (const auto& n : names) {
         if (c->quit) throw std::runtime_error("destroyed while building");
-        lite ? k.load_lite(d, utf8(c->shader_dir), {n}) : k.load(d, utf8(c->shader_dir), {n});
+        lite ? k.load_lite(d, utf8(c->shader_dir), {n}, lite) : k.load(d, utf8(c->shader_dir), {n});
     }
 }
 
@@ -570,14 +572,18 @@ void build_lite(Ctx* c) {
     auto t0 = std::chrono::steady_clock::now();
     try {
         const uint32_t h0 = c->use_d3d ? c->dx->cache_hits() : 0, m0 = c->use_d3d ? c->dx->cache_misses() : 0;
-        load_each(c, c->net_lite, d, c->net.names(), true);
+        load_each(c, c->net_lite, d, c->net.names(), "_lt");
         if (c->net_lite.names().empty()) throw std::runtime_error("no *_lt kernels in the shader folder");
+        load_each(c, c->net_lx, d, c->net.names(), "_lx");
+        const size_t lx = c->net_lx.names().size();
+        if (lx) load_each(c, c->net_lx, d, c->net.names(), "_lt");
+        g_log("experimental level: %zu kernels of its own%s", lx, lx ? "" : " (not in the shader folder, it runs as the fast mode)");
         g_log("fast mode kernels ready (%zu pipelines: %u ELFs from the cache, %u built) in %.2f s", c->net_lite.names().size(),
               c->use_d3d ? c->dx->cache_hits() - h0 : 0, c->use_d3d ? c->dx->cache_misses() - m0 : 0,
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         c->lite_built = true;
     } catch (const std::exception& e) {
-        { std::lock_guard l(c->m); c->net_lite.unload(d); }
+        { std::lock_guard l(c->m); c->net_lite.unload(d); c->net_lx.unload(d); }
         c->lite_failed = true;
         g_log("fast mode not available: %s", e.what());
     }
@@ -987,8 +993,14 @@ bool prepare_network(Ctx* c, Gpu& d, I2 render, F&& idle) {
     const bool network = c->engine_ready && c->state == ONR_RR_STATE_READY && c->engine.kernels() != nullptr;
     if (network && c->lite_want && !c->lite_started.exchange(true)) c->lite_builder = std::thread(build_lite, c);
     if (network && c->lite_built) {
-        c->engine.set_lite(&c->net_lite);
+        const bool lx = c->lx_want && !c->net_lx.names().empty();
+        c->engine.set_lite(lx ? &c->net_lx : &c->net_lite);
+        c->engine.set_deep_on(lx);
         c->engine.set_lite_on(c->lite_want);
+        if (c->lite_want && c->lx_logged != int(lx)) {
+            c->lx_logged = lx;
+            g_log("experimental level %s at frame %llu", lx ? "on" : "off", (unsigned long long)c->frames);
+        }
         if (c->lite_logged != c->lite_want) {
             c->lite_logged = c->lite_want;
             g_log("fast mode %s at frame %llu", c->lite_logged ? "on" : "off", (unsigned long long)c->frames);
@@ -1093,6 +1105,7 @@ void free_ctx(Ctx* c) {
     // the network was built on D3D12 only while that backend stayed on
     Gpu& net = c->use_d3d ? static_cast<Gpu&>(*c->dx) : c->dev;
     c->net_lite.unload(net);
+    c->net_lx.unload(net);
     c->net.unload(net);
     c->kern.unload(c->dev);
     VkDevice v = c->dev.vk();
@@ -2847,15 +2860,18 @@ int32_t GetLastErrorText(char* buf, uint32_t n) {
 extern "C" int32_t OnrRrSetFastMode(void* context, int32_t on) {
     if (!context) return ONR_RR_INVALID_ARGUMENT;
     static_cast<Ctx*>(context)->lite_want = on != 0;
+    static_cast<Ctx*>(context)->lx_want = on == 2;   // 2: the experimental level on top of the mode
     return ONR_RR_OK;
 }
 
-// 0 off, 1 on, 2 asked and its kernels still building, 3 asked and not available
+// 0 off, 1 on, 2 asked and its kernels still building, 3 asked and not available, 4 on at the experimental level
 extern "C" int32_t OnrRrGetFastMode(void* context) {
     if (!context) return 0;
     auto* c = static_cast<Ctx*>(context);
     if (!c->lite_want) return 0;
-    return c->lite_failed ? 3 : c->lite_built ? 1 : 2;
+    if (c->lite_failed) return 3;
+    if (!c->lite_built) return 2;
+    return c->lx_want && !c->net_lx.names().empty() ? 4 : 1;
 }
 
 extern "C" int32_t OnrRrSetDeltaRate(void* context, float rate) {

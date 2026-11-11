@@ -24,16 +24,34 @@ set(FLOW_KERNELS enc_stage_96_128_128 enc_stage_128_128_160 enc_stage_160_256_16
 # the user's "Fast mode" (docs/FASE24-FASTMODE.md): each listed kernel again with these defines, suffix _lt beside the file
 # it replaces. Engine::set_lite loads whichever exist, so removing a file from the stage stops the ladder at that cut.
 include(${CMAKE_CURRENT_SOURCE_DIR}/fastmode.cmake)
+option(ONR_F_SYM "LT_SYM in the Legacy C = 32 kernels: the same output bits with fewer products" ON)
+# a define of the mode that changes what the engine launches, not only a kernel
+if("LT_ATTR_NODS2=1" IN_LIST LT_DEFS_enc0_attr)
+    add_compile_definitions(ONR_LT_NODS2=1)
+endif()
 function(lite_spv out_name src)
-    set(spvl ${SPV_DIR}/${out_name}_lt.spv)
+    set(spvl ${SPV_DIR}/${out_name}${LITE_SUFFIX}.spv)
     add_custom_command(OUTPUT ${spvl}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
         COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${ARGN} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvl} ${src}
         DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
     set(LITE_SPVS ${LITE_SPVS} ${spvl} PARENT_SCOPE)
 endfunction()
+set(LITE_SUFFIX _lt)
 foreach(src ${SHADERS})
     get_filename_component(name ${src} NAME_WE)
+    if(DEFINED LX_DEFS_${name})   # network kernels only
+        set(lxd)
+        foreach(x ${LX_DEFS_${name}})
+            list(APPEND lxd -D${x})
+        endforeach()
+        set(LITE_SUFFIX _lx)
+        lite_spv(${name}_f ${src} -DENC_F32=1 ${lxd})
+        if(name STREQUAL "enc0_stage_32_64")
+            lite_spv(${name}_f_w ${src} -DENC_F32=1 -DATTR_WIDE=1 ${lxd})
+        endif()
+        set(LITE_SUFFIX _lt)
+    endif()
     if(DEFINED LT_DEFS_${name})
         set(ltd)
         foreach(x ${LT_DEFS_${name}})
@@ -92,10 +110,16 @@ foreach(src ${SHADERS})
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spve})
         # and the fast variant: fp32 accumulation over the whole K of each product (ENC_F32), suffix _f
+        # ONR_F_SYM: LT_SYM in the Legacy kernels of the C = 32 levels too (onr_w1_head.glsl). Same output bits (72 of 72
+        # frames against 0.1.4), fewer products: 0.02 ms off the frame at Performance 1080p, 0.055 at Quality, 0.10 at 1440p
+        set(fsym)
+        if(ONR_F_SYM AND name MATCHES "^(enc0_stage_32_64|dec_up_32_64_64|dec_head_32_64)$")
+            set(fsym -DLT_SYM=1)
+        endif()
         set(spvf ${SPV_DIR}/${name}_f.spv)
         add_custom_command(OUTPUT ${spvf}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 ${fsym} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvf})
         if(NOT name MATCHES "^enc_block_")
@@ -157,10 +181,14 @@ foreach(src ${SHADERS})
     # the fast enc0 halves with the 64-byte attribute record (ATTR_WIDE, suffix _f_w): a frame with a depth of field
     # guide or a responsivity mask, whose attributes 32 / 33 the 48-byte record has no room for
     if(name MATCHES "^(enc0_attr|enc0_stage_32_64)$")
+        set(fsymw)
+        if(ONR_F_SYM AND name STREQUAL "enc0_stage_32_64")
+            set(fsymw -DLT_SYM=1)
+        endif()
         set(spvw ${SPV_DIR}/${name}_f_w.spv)
         add_custom_command(OUTPUT ${spvw}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -DATTR_WIDE=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -DATTR_WIDE=1 ${fsymw} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvw})
         list(APPEND RUNTIME_SPVS ${spvw})
@@ -179,6 +207,9 @@ add_custom_target(shaders ALL DEPENDS ${SPVS} ${LITE_SPVS})
 
 add_library(opennr_rr STATIC src/vk.cpp src/d3d12.cpp src/kernels.cpp src/weights.cpp src/engine.cpp)
 target_include_directories(opennr_rr PUBLIC include)
+if(LT_ENGINE_DEEP)
+    target_compile_definitions(opennr_rr PRIVATE ONR_LT_DEEP="${LT_ENGINE_DEEP}")
+endif()
 target_link_libraries(opennr_rr PUBLIC Vulkan::Vulkan d3d12 dxgi)
 add_dependencies(opennr_rr shaders)
 

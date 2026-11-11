@@ -121,10 +121,16 @@ layout(local_size_x = 128 * SPLIT) in;
 // LT_FAR: the key tiles (two window rows each) LT_FAR or more tiles from the own one are left out of the softmax. Their P
 // mass is small: attention is local inside the window. tile = own tile, kt = key tile
 #ifdef LT_FAR
+// LT_FAR1 (W1): head 1 on its own distance, LT_FAR is head 0's (the heads differ a lot in how far they look)
+#ifdef LT_FAR1
+#define KEPT(tile, kt) ((tile) + (hd == 0u ? uint(LT_FAR) : uint(LT_FAR1)) > (kt) && (kt) + (hd == 0u ? uint(LT_FAR) : uint(LT_FAR1)) > (tile))
+#else
 #define KEPT(tile, kt) ((tile) + uint(LT_FAR) > (kt) && (kt) + uint(LT_FAR) > (tile))
+#endif
 #define IFK(tile, kt) if (KEPT(tile, kt))
 #define TK(tile, kt, x) (KEPT(tile, kt) ? (x) : f16vec2(0.0hf))
 #else
+#define KEPT(tile, kt) true
 #define IFK(tile, kt)
 #define TK(tile, kt, x) (x)
 #endif
@@ -365,10 +371,16 @@ layout(push_constant, scalar) uniform P {
 #ifndef PRS
 #define PRS (16u * SST)
 #endif
-shared LdsH { float16_t lds[LDS_N]; };
-shared LdsW { uint lds1[LDS_N / 2u]; };
-shared LdsD { uvec2 lds2[LDS_N / 4u]; };
-shared LdsQ { uvec4 lds4[LDS_N / 8u]; };
+// LDS_MIN (halves): a larger block than the body needs, so fewer workgroups share a compute unit (measurements)
+#ifdef LDS_MIN
+#define LDS_A max(LDS_N, uint(LDS_MIN))
+#else
+#define LDS_A LDS_N
+#endif
+shared LdsH { float16_t lds[LDS_A]; };
+shared LdsW { uint lds1[LDS_A / 2u]; };
+shared LdsD { uvec2 lds2[LDS_A / 4u]; };
+shared LdsQ { uvec4 lds4[LDS_A / 8u]; };
 #else
 #define XS 0u
 #define QO (64u * ENC_C)

@@ -28,16 +28,32 @@ layout(push_constant, scalar) uniform P {
 const uint W_ODD[5] = uint[5](0xa8e7u, 0x35f4u, 0x38f6u, 0x2d96u, 0xa94bu);
 
 f16vec3 texel(int x, int y, int lo, int hi) {
+#ifndef LT_DS_FAST
     if (x < lo || x >= hi) return f16vec3(0.0hf);
+#endif
     uint i = uint(y * pc.slice.x + (x - lo));
 #ifdef LT_DS_LOAD
+#ifdef LT_DS_FAST
+    // the engine's one slice covers the columns: never outside. 32-bit offsets
+    return f16vec3(AT32(F16x2Buf, pc.rg, i, 4u).v[0], AT32(F16Buf, pc.b, i, 2u).v[0]);
+#else
     return f16vec3(AT32(F16x2Buf, pc.rg, i, 4u).v[0], pc.b.v[i]);   // the same bits, one load for the two halves
+#endif
 #else
     return f16vec3(pc.rg.v[2u * i], pc.rg.v[2u * i + 1u], pc.b.v[i]);
 #endif
 }
 
+#ifdef LT_DS_FAST
+// the weights as selects of constants: the array is a load per lane from the code's constants, with 64-bit addresses
+#define WT1(k_, a_, b_) case k_: return p ? hbits(a_) : hbits(b_);
+float16_t wt(int k, int parity) {
+    bool p = parity == 1;
+    switch (k) { WT1(0, 0xa8e7u, 0xa94bu) WT1(1, 0x35f4u, 0x2d96u) WT1(2, 0x38f6u, 0x38f6u) WT1(3, 0x2d96u, 0x35f4u) default: return p ? hbits(0xa94bu) : hbits(0xa8e7u); }
+}
+#else
 float16_t wt(int k, int parity) { return hbits(W_ODD[parity == 1 ? k : 4 - k]); }
+#endif
 
 f16vec3 hpass(int row, int cx, int px, int lo, int hi) {
     precise f16vec3 acc = f16vec3(0.0hf);
@@ -48,7 +64,11 @@ f16vec3 hpass(int row, int cx, int px, int lo, int hi) {
         mn = k == 0 ? x : min(mn, x);
         mx = k == 0 ? x : max(mx, x);
     }
+#ifdef LT_DS_NOCLAMP
+    return acc;   // no clamp to the taps' range, on either pass
+#else
     return min(max(acc, mn), mx);
+#endif
 }
 
 // horizontal passes of the workgroup's rows, shared by the 16 output rows (each was computed 5 times before)
@@ -75,7 +95,11 @@ void main() {
         mn = k == 0 ? h : min(mn, h);
         mx = k == 0 ? h : max(mx, h);
     }
+#ifdef LT_DS_NOCLAMP
+    vec3 v = vec3(acc);
+#else
     vec3 v = vec3(min(max(acc, mn), mx));
+#endif
     float inv_e = rcp_rn(pc.exposure.v[0]);
     uint base = uint(o.y * pc.out_size.x + o.x) * 4u;
     f16vec4 q = f16vec4(1.0hf);

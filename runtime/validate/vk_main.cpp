@@ -367,7 +367,10 @@ int wmain(int argc, wchar_t** argv) {
         auto get_fast = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFastMode"));
         const int fast_flip = getenv("ONR_VALIDATE_FAST_FLIP") ? atoi(getenv("ONR_VALIDATE_FAST_FLIP")) : 0;
         const int fast_at = getenv("ONR_VALIDATE_FAST_AT") ? atoi(getenv("ONR_VALIDATE_FAST_AT")) : -1;
-        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, 1);
+        // ONR_VALIDATE_FAST_LEVEL=2: the level FAST_AT and FAST_FLIP ask for (2 is the experimental one); ONR_VALIDATE_FAST=2 too
+        const int fast_level = getenv("ONR_VALIDATE_FAST_LEVEL") ? atoi(getenv("ONR_VALIDATE_FAST_LEVEL"))
+                               : getenv("ONR_VALIDATE_FAST") && atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1;
+        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, fast_level);
         printf("render %ux%u -> %ux%u, %d frames, _f, backend %s, guides %s, depth %s\n", RW, RH, OW, OH, nframes,
                backend == ONR_RR_BACKEND_VULKAN_HOST ? "Vulkan host" : "other", general ? "GENERAL" : "SHADER_READ_ONLY_OPTIMAL",
                depth_kind == 2 ? "D32_SFLOAT_S8_UINT" : depth_kind ? "D32_SFLOAT" : "R32_SFLOAT");
@@ -577,8 +580,8 @@ int wmain(int argc, wchar_t** argv) {
         int bad = 0;
         double lo = 1e9, hi = 0;
         for (int f = 0; f < nframes; ++f) {
-            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? 1 : 0);
-            if (f == fast_at && set_fast) set_fast(ctx, 1);
+            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? fast_level : 0);
+            if (f == fast_at && set_fast) set_fast(ctx, fast_level);
             if (f) run_frame(f, true);
             if (f == fast_at && get_fast) {
                 const auto w0 = std::chrono::steady_clock::now();
@@ -604,6 +607,12 @@ int wmain(int argc, wchar_t** argv) {
             double db = se > 0 ? 10 * std::log10(peak * peak / (se / double(cnt))) : 999;
             lo = std::min(lo, db), hi = std::max(hi, db);
             printf("%5d  %7.2f  %7.3f  %7.2f  %016llx\n", f, db, 100.0 * double(eq) / double(cnt), info.gpu_ms_last, (unsigned long long)hash);
+            // ONR_VALIDATE_DUMP=<prefix>: every frame's output, rgba16f rows, as <prefix><frame>.raw (as the D3D12 validator)
+            if (const char* dp = getenv("ONR_VALIDATE_DUMP")) {
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s%04d.raw", dp, f);
+                if (FILE* df = fopen(fn, "wb")) fwrite(m, 2, size_t(OW) * OH * 4, df), fclose(df);
+            }
             bad += db < 45;
         }
         printf("PSNR %.2f .. %.2f dB over %d frames%s\n", lo, hi, nframes, bad ? " (some below 45 dB)" : "");

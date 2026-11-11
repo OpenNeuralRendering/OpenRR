@@ -117,6 +117,34 @@ float depth_at(ivec2 p) { return g_depth(pc.gt, clampi(p, pc.size), pc.size.x); 
 uvec3 alb_at(ivec2 p) { uint w = g_rgba8(pc.gt, GS_ALBEDO, p, pc.size.x); return uvec3(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u); }
 uvec3 spec_at(ivec2 p) { uint w = g_rgba8(pc.gt, GS_SPEC, p, pc.size.x); return uvec3(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u); }
 vec2 mv_raw(ivec2 p) { return vec2(g_rg16f(pc.gt, GS_MV, p, pc.size.x)); }
+#ifdef LT_ATTR_D9
+// the 3x3 depths of the pixel, row by row, all read before any is used (one wait, not one per texel): the reads, then
+// g_depth's conversion
+void depth9_read(ivec2 X, out float z[9]) {
+    GuideTab t = pc.gt;
+    ivec2 q[9];
+    [[unroll]] for (int k = 0; k < 9; ++k) q[k] = clampi(X + ivec2(k % 3 - 1, k / 3 - 1), pc.size);
+    if (!gdirect(t, GS_DEPTH)) {
+        [[unroll]] for (int k = 0; k < 9; ++k) z[k] = F32Buf(t.buf[GS_DEPTH]).v[q[k].y * pc.size.x + q[k].x];
+        return;
+    }
+    const uvec4 g = t.g[GS_DEPTH];
+    float d[9] = float[9](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    if ((((g.z >> 16) & 255u) & 4u) == 0u) {
+        const ivec2 o = ivec2(g.w & 65535u, g.w >> 16);
+        [[unroll]] for (int k = 0; k < 9; ++k) d[k] = texelFetch(tex[g.x], o + q[k], 0).x;
+    }
+    z = d;
+}
+void depth9_view(inout float d[9]) {
+    GuideTab t = pc.gt;
+    if (!gdirect(t, GS_DEPTH) || (gflags(t, GS_DEPTH) & 2u) == 0u) return;
+    [[unroll]] for (int k = 0; k < 9; ++k) {
+        float den = d[k] * t.proj.y - t.proj.x;
+        d[k] = abs(den) > 1e-20 ? (t.proj.z - d[k] * t.proj.w) / den * t.depth_sign : 1e30;
+    }
+}
+#endif
 #ifdef LT_ATTR_DEPTH
 float depth_key(ivec2 p) {
     p = clampi(p, pc.size);
@@ -267,9 +295,15 @@ float enc_log(float x) {
 bool inside(float px, float py) { return px >= 0.0 && py >= 0.0 && !(px > float(pc.hist_size.x)) && !(py > float(pc.hist_size.y)); }
 
 // virtual motion vector of the specular reflection (pixels, before the 2.25 scale)
+#if defined(LT_ATTR_D9) && defined(D3D_GUIDES)
+float g_zc;   // the pixel's own depth, read with its 3x3
+#define DEPTH_C(X) g_zc
+#else
+#define DEPTH_C(X) depth_at(X)
+#endif
 vec2 reflection_mv(ivec2 X, vec3 n) {
     precise float fx = float(X.x) + 0.5, fy = float(X.y) + 0.5;
-    float d = depth_at(X);
+    float d = DEPTH_C(X);
     precise float w = fma(fx, C(0x4f0), fy * C(0x500));
     precise float z = fma(d, C(0x44c), C(0x45c));
     if (!(C(0x460) >= 1.0)) { precise float dz = d * C(0x450); z = rcp_c(dz) * z; }
@@ -337,6 +371,11 @@ void main() {
     float expo = pc.expo.v[0];
     // DFN image: exposed colour, NaN -> 0, at most 65504; padded rows mirror at the image height
     ivec2 S = ivec2(X.x < pc.size.x ? X.x : 2 * pc.size.x - 2 - X.x, X.y < pc.size.y ? X.y : 2 * pc.size.y - 2 - X.y);
+#ifdef LT_ATTR_LATE
+    // every store of the thread at its end: a load from a uniform address (the guide table, the parameter block) after a
+    // store is a load per lane with its wait, before any store it is a scalar load
+    f16vec4 dfn_px = f16vec4(0.0hf);
+#else
     {
         uint o = gid * 4u;
         vec3 cs = col_at(S);
@@ -346,6 +385,7 @@ void main() {
         }
         AT32(F16Buf, pc.dfn, o, 2u).v[3] = 0.0hf;
     }
+#endif
 #ifdef ATTR64
     const bool side = X == S;   // the motion surfaces are written by the image's own pixels
     const uint noise = uint(pc.lut.v[pc.frame8 * 256u + uint((X.y & 15) * 16 + (X.x & 15))]) >> 9;
@@ -358,7 +398,13 @@ void main() {
     precise float rexp = rcp_c(pc.expo.v[1]);
     float explog = pc.expo.v[3];
     // 3x3 depth extremes: centre first, then row by row, strict comparisons
-#if defined(LT_ATTR_DEPTH) && defined(D3D_GUIDES)
+#if defined(LT_ATTR_D9) && defined(D3D_GUIDES)
+    float z9[9];
+    depth9_read(X, z9);
+    depth9_view(z9);
+    g_zc = z9[4];
+    float a0 = abs(z9[4]), mx = a0, mn = a0;
+#elif defined(LT_ATTR_DEPTH) && defined(D3D_GUIDES)
     float a0 = depth_key(X), mx = a0, mn = a0;
 #else
     float a0 = abs(depth_at(X)), mx = a0, mn = a0;
@@ -368,7 +414,9 @@ void main() {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue;
             ivec2 q = clampi(X + ivec2(dx, dy), pc.size);
-#if defined(LT_ATTR_DEPTH) && defined(D3D_GUIDES)
+#if defined(LT_ATTR_D9) && defined(D3D_GUIDES)
+            float s = abs(z9[(dy + 1) * 3 + dx + 1]);
+#elif defined(LT_ATTR_DEPTH) && defined(D3D_GUIDES)
             // hardware depth: the same order as its view z, without a division per texel
             float s = depth_key(q);
 #else
@@ -396,12 +444,14 @@ void main() {
         refl = reflection_mv(X, nrm);
     }
     uint pi = pix(X);
+#ifndef LT_ATTR_LATE
     if (side) {
         AT32(F16Buf, pc.pmv2, pi, 8u).v[0] = float16_t(mv_near.x); AT32(F16Buf, pc.pmv2, pi, 8u).v[1] = float16_t(mv_near.y);
         AT32(F16Buf, pc.pmv2, pi, 8u).v[2] = float16_t(refl.x); AT32(F16Buf, pc.pmv2, pi, 8u).v[3] = float16_t(refl.y);
         AT32(F16Buf, pc.ero, pi, 4u).v[0] = float16_t(mv_far.x); AT32(F16Buf, pc.ero, pi, 4u).v[1] = float16_t(mv_far.y);
         AT32(F16Buf, pc.nond, pi, 4u).v[0] = float16_t(mv_c.x); AT32(F16Buf, pc.nond, pi, 4u).v[1] = float16_t(mv_c.y);
     }
+#endif
 
     // motion consistency against the previous frame's vectors
     precise float fx = float(X.x) + 0.5, fy = float(X.y) + 0.5;
@@ -427,6 +477,13 @@ void main() {
 
     vec3 col = col_at(X);
     uint base = pi * 48u;
+#ifdef LT_ATTR_LATE
+    // the DFN image's pixel from the same read (X is the mirrored pixel here)
+    [[unroll]] for (uint c = 0u; c < 3u; ++c) {
+        precise float e = expo * col[c];
+        dfn_px[c] = float16_t(clamp(min(no_nan(e), 65504.0), -65504.0, 65504.0));
+    }
+#endif
     [[unroll]] for (uint c = 0u; c < 3u; ++c) { precise float e = expo * col[c]; put(base, c, enc_log(min(no_nan(e), 65504.0))); }
 
     // reprojected history: dilated (3), non-dilated (6), the same on DownsampledHistory2 (9), eroded (12), reflection (35)
@@ -471,7 +528,12 @@ void main() {
 #endif
         if (k == 1) {
             precise float u2 = (u * float(CI(0x350))) * C(0x360), v2 = (v * float(CI(0x354))) * C(0x364);
+#ifdef LT_ATTR_NODS2
+            // no DownsampledHistory2: its attributes take DownsampledHistory at the same place (pooled_history2 is not run)
+            vec4 h2 = h;
+#else
             vec4 h2 = bl_10(pc.ds2, pc.ds2_size, u2, v2);
+#endif
 #ifdef LT_ATTR_CL
             [[unroll]] for (uint c = 0u; c < 3u; ++c) {
                 precise float e = (valid ? (near1 ? hist_closed(h2[c], rho1) : enc_log(expo * decode_hist(h2[c], rexp))) : enc_log(expo * col[c])) * C(0x3a4);
@@ -489,10 +551,19 @@ void main() {
         if (k == 3) { hxr = hxp; hyr = hyp; vr = valid; }
     }
     // recurrent hidden state at the dilated (26) and reflection (39) reprojections
+#ifdef LT_ATTR_HID1
+    vec4 hid0 = vec4(0.0);
+#endif
     [[unroll]] for (int k = 0; k < 2; ++k) {
         float hx = k == 0 ? hxd : hxr, hy = k == 0 ? hyd : hyr;
         precise float uh = fma(hx, C(0x310), C(0x318)), vh = fma(hy, C(0x314), C(0x31c));
+#ifdef LT_ATTR_HID1
+        // the hidden state read once, at the dilated reprojection, for both
+        vec4 hs;
+        if (k == 0) hs = hid0 = bl_hid(uh, vh); else hs = hid0;
+#else
         vec4 hs = bl_hid(uh, vh);
+#endif
         bool valid = k == 0 ? vd : vr;
         [[unroll]] for (uint c = 0u; c < 4u; ++c) {
             precise float a = (valid ? hs[c] : 0.0) * C(0x3a8);
@@ -548,6 +619,14 @@ void main() {
     put(base, 34u, explog);
     [[unroll]] for (uint k = 43u; k < 48u; ++k) put(base, k, 0.0);
     U32x4View o = U32x4View(uint64_t(pc.attr));
+#ifdef LT_ATTR_LATE
+    AT32(F16x4Buf, pc.dfn, gid, 8u).v[0] = dfn_px;
+    if (side) {
+        AT32(F16x4Buf, pc.pmv2, pi, 8u).v[0] = f16vec4(f16vec2(mv_near), f16vec2(refl));
+        AT32(F16x2Buf, pc.ero, pi, 4u).v[0] = f16vec2(mv_far);
+        AT32(F16x2Buf, pc.nond, pi, 4u).v[0] = f16vec2(mv_c);
+    }
+#endif
 #ifdef ATTR64
     // the dither of enc0 (DITH in onr_block_w1.glsl), two attributes per word
     uint nn = noise | noise << 16, hb[12], pl[2] = uint[2](0u, 0u), dprev = 0u;

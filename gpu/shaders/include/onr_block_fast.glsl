@@ -265,7 +265,10 @@ ACC bias_acc_t(F16Buf b, uint n0) {
 // at C = 64 too)
 #define FP8QV (ENC_F32 && TR && ENC_EMBED == 0 && ENC_MERGE_IN == 0 && DEC_UP == 0 && ENC_C >= 64)
 #endif
-#if FP8QV
+// LT_UP8 (decoder _0, W1 and W2) and LT_MI8 (enc1): the up and the input merge products on e4m3 x e4m3 -> fp32 as well. Their B
+// operands are the e4m3 bytes of the planes they read and their weights are exact e4m3 (Engine::upload_stage keeps the codes
+// after the fp16 values); one rounding to fp16 per output instead of one per 16 K
+#if FP8QV || defined(LT_UP8) || defined(LT_MI8)
 #extension GL_EXT_float_e4m3 : require
 #define QA8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define QB8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
@@ -282,6 +285,13 @@ uint ocp4(uint w) {
     uint zm = (z >> 7) * 0xffu;
     return (w & ~zm) | (((w & 0x80808080u) | k) & zm);
 }
+// LT_E8RAW (with LT_UP8 / LT_MI8): the plane bytes taken as OCP codes as they are. Only the codes of exponent field 0 differ
+// (magnitudes under 2^-6: (8 + m) 2^-10 read as m 2^-9), and the 8 operations per word of ocp4 go
+#ifdef LT_E8RAW
+#define OCP4(w) (w)
+#else
+#define OCP4(w) ocp4(w)
+#endif
 #define W8STEP(acc, addr, off, b) { QA8 a_; coopMatLoad(a_, E4View(addr).v, off, ENC_C, ROW); acc = coopMatMulAdd(a_, b, acc); }
 #endif
 
@@ -365,9 +375,42 @@ uint exp_bits2(f16vec2 s) {
     return pack32(unpack16(packFloat2x16(yv)) << 5us);
 }
 
+#ifdef LT_GELU
+// LT_GELU=k (W1): the gate a straight line to its clamp, 2 operations. LT_GELU_PART: 1 only the block's MLP, 2 only the embed
+f16vec2 gelu_lin2(f16vec2 x) {
+    precise f16vec2 gl = min(max(fma(x, f16vec2(float16_t(LT_GELU)), f16vec2(0.5hf)), f16vec2(0.0hf)), f16vec2(1.0hf));
+    precise f16vec2 rl = x * gl;
+    return rl;
+}
+#endif
+
+#if defined(LT_GELU4) || defined(LT_G4)
+// LT_GELU4 (every GELU of the kernel) / LT_G4 (W1: bit 0 the embed, bit 1 the block's MLP): the gate in straight pieces to its
+// clamp, slope G4_K1 on |x| <= G4_X1 and G4_K2 from there on: 4 operations (the inner piece is the first clamp, then one fma
+// each for the offset and the gate)
+#ifndef G4_K1
+#define G4_K1 0.35
+#define G4_K2 0.18
+#define G4_X1 0.95
+#endif
+f16vec2 gelu_pw2(f16vec2 x) {
+    precise f16vec2 w4 = min(max(fma(x, f16vec2(float16_t(0.5 / G4_X1)), f16vec2(0.5hf)), f16vec2(0.0hf)), f16vec2(1.0hf));
+    precise f16vec2 q4 = fma(w4, f16vec2(float16_t(2.0 * (G4_K1 - G4_K2) * G4_X1)), f16vec2(float16_t(0.5 - (G4_K1 - G4_K2) * G4_X1)));
+    precise f16vec2 g4 = min(max(fma(x, f16vec2(float16_t(G4_K2)), q4), f16vec2(0.0hf)), f16vec2(1.0hf));
+    precise f16vec2 r4 = x * g4;
+    return r4;
+}
+#endif
+
 f16vec2 gelu2(f16vec2 x) {
+#ifdef LT_RELU
+    return max(x, f16vec2(0.0hf));   // measurements: the activation's ceiling
+#endif
 #ifdef PROF_NOGELU
     return x * 0.5hf;   // timing only
+#endif
+#ifdef LT_GELU4
+    return gelu_pw2(x);
 #endif
     // same bits as clamping x to [-2, 2]: on |x| <= 2 nothing changes, past it u is 0.25 and the clamp of g to [0, 1]
     // (the fma's clamp bit) gives the 0 or 1 the clamped x gives. Written as min / max: clamp() is split into two

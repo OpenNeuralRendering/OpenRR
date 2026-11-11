@@ -303,7 +303,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         auto set_fast = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFastMode"));
         auto get_fast = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFastMode"));
-        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, 1);
+        if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1);
         // ONR_VALIDATE_IDLE=1: a second context that never records, so two networks live in the process
         void* idle = nullptr;
         if (getenv("ONR_VALIDATE_IDLE")) {
@@ -990,10 +990,13 @@ int wmain(int argc, wchar_t** argv) {
         // the kernels (frame n itself still runs on the others if they are not built)
         const int fast_flip = getenv("ONR_VALIDATE_FAST_FLIP") ? atoi(getenv("ONR_VALIDATE_FAST_FLIP")) : 0;
         const int fast_at = getenv("ONR_VALIDATE_FAST_AT") ? atoi(getenv("ONR_VALIDATE_FAST_AT")) : -1;
+        // ONR_VALIDATE_FAST_LEVEL=2: the level FAST_AT and FAST_FLIP ask for (2 is the experimental one); ONR_VALIDATE_FAST=2 too
+        const int fast_level = getenv("ONR_VALIDATE_FAST_LEVEL") ? atoi(getenv("ONR_VALIDATE_FAST_LEVEL"))
+                               : getenv("ONR_VALIDATE_FAST") && atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1;
         auto fast_sync = [&](int f) {
-            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? 1 : 0);
+            if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? fast_level : 0);
             if (f == fast_at && set_fast) {
-                set_fast(ctx, 1);
+                set_fast(ctx, fast_level);
             }
         };
         printf("frame  PSNR dB  equal %%   GPU ms (ingest + network + pack)  output hash\n");

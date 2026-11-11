@@ -147,6 +147,13 @@ public:
     void set_lite(const Kernels* k) { lk_ = k; }
     void set_lite_on(bool on) { lite_on_ = on; }
     bool lite_active() const { return frame_lite_; }
+    // the fast mode's deep levels from an earlier frame. mode 0: off; 1: the levels from `level` down
+    // run once every `period` frames and the decoder above reads their last output in between; 2: they run every frame,
+    // beside the decoder levels above, which read the previous frame's output; 3: they run two frames in four, the other
+    // two read the output of two frames before. guard: frames after a reset that run as usual
+    void set_deep(int mode, int level, int period, int guard) { deep_mode_ = mode, deep_level_ = level, deep_period_ = period, deep_guard_ = guard; }
+    // LT_ENGINE_DEEP belongs to the experimental level: off until the runtime asks (ONR_RR_DEEP turns it on by itself)
+    void set_deep_on(bool on) { deep_on_ = on; }
 
 private:
     struct StageBufs { Buffer in_a, in_b, out, out_b, fc1, fc1_b, fc2, fc2_b, bias, dfn_w, dfn_b, mrg_w, mrg_b, up_w, up_b; };
@@ -198,6 +205,14 @@ private:
     Buffer attr_, img_, ero_, nond_, pmv2_[2], hidden_[2], down_[2], hist_[2], expo_[2];
     Buffer pdst_, acc_, blk_, tile_, fix_, frg_, fb_, ajab_, mvf_, aniso_, prm_;
     Buffer attr_wide_;   // the 64-byte record (enc0_attr_f_w), made on the first frame that needs it
+    int deep_mode_ = 0, deep_level_ = 4, deep_period_ = 2, deep_guard_ = 0;
+    bool deep_on_ = false;
+    int deep_part_ = 0;
+    bool deep_pair_ = true;          // mode 2: the deep kernels launched beside the decoder levels above (off: one after the other)
+    Buffer deep_t_[2], deep_d_[2];   // the deep levels' last tensor and DFN image (set_deep), made on the first frame that needs them
+    uint64_t deep_wrote_ = ~0ull;    // frame_ of the last frame that wrote them
+    uint64_t deep_wb_[2] = {~0ull, ~0ull};   // mode 3: per buffer
+    uint64_t deep_since_ = 0;        // fast mode frames since the last reset
 };
 
 }  // namespace onr
