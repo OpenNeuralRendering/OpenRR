@@ -37,6 +37,7 @@ struct Kernel {
 
 struct DeviceInfo {
     std::string name;
+    uint32_t vendor = 0;
     uint32_t driver_version = 0;
     std::string driver_info;
     bool fp8_coopmat = false;
@@ -144,6 +145,7 @@ public:
 
     // SPIR-V file -> compute pipeline. All kernels share one layout: 256 bytes of push constants.
     Kernel load(const std::string& spv_path, uint32_t subgroup = 0) override;   // subgroup: required size, 0 = any
+    VkPipelineCreateFlags pipeline_flags = 0;   // added to every pipeline load() makes (rr_probe)
     void destroy(Kernel& k) override;
     std::string stats(const Kernel& k);   // compiler statistics (registers, spills), if the driver exposes them
     // the 48 bytes of a combined image sampler descriptor (DeviceOptions::descriptors); false without the extension

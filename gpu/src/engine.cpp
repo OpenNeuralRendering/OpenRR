@@ -820,7 +820,8 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
     const DownsamplePC ds{frg_.addr, fb_.addr, out, blk_.addr, internal_, f.output, {0, 0}, f.output, internal_, {0, internal_.x}};
     // out_image_: out is the origin x | y << 16 in the D3D12 output texture, written by the d3d_ variants
     const bool img = out_image_ && k_->has("d3d_downsample") && k_->has("d3d_downsample_tl");
-    if (f.transparency && k_->has("downsample_tl")) {
+    const bool tl = f.transparency || (img && f.transparency_view);
+    if (tl && k_->has("downsample_tl")) {
         if (!tlh_[0].addr)   // never read before written: the layer's first frame takes no history
             for (auto& b : tlh_) b = d.create(size_t(f.output.x) * f.output.y * 8 + 64);
         // the parameters NGX gives the kernel (constant 0.25 weight and output / internal motion scale in its captures)
@@ -832,6 +833,7 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
             p.mv_scale[i] = o[i] / ir[i];
         }
         p.weight = 0.25f, p.reset = reset || !tl_last_ ? 1u : 0u;
+        if (img) p.tl_view = f.transparency_view, p.tl_origin = f.transparency_origin;
         if (f.transparency_motion) {
             p.tlmv = f.transparency_motion, p.tlmv_size = f.transparency_motion_size;
             p.tlmv_scale[0] = f.mv_scale[0], p.tlmv_scale[1] = f.mv_scale[1];
@@ -849,7 +851,7 @@ void Engine::record_post(const EngineFrame& f, uint64_t out, DfnEdit edit, const
     } else {
         (frame_lite_ && lk_->has("downsample") ? *lk_ : K).downsample(d, ds);
     }
-    tl_last_ = f.transparency != 0;
+    tl_last_ = tl;
     to_last_ = tl_last_ && f.transparency_opacity != 0;
 
     memcpy(prev_w2v_, f.world_to_view, sizeof prev_w2v_);

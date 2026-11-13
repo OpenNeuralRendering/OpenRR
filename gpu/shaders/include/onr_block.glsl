@@ -79,8 +79,11 @@
 // the runtime path (onr_block_fast.glsl): k8 with every product on WMMA
 #define ONR_FAST (ENC_K8 != 0 && ENC_PVX == 0 && ENC_EXACT == 0 && ENC_K8H == 0)
 // low-resolution levels (few windows): two subgroups per row tile, 256 lanes per window
+#ifndef SPLIT_C
+#define SPLIT_C 160
+#endif
 #ifndef SPLIT
-#if ONR_FAST && ENC_C >= 160
+#if ONR_FAST && ENC_C >= SPLIT_C
 #define SPLIT 2
 #else
 #define SPLIT 1
@@ -371,11 +374,24 @@ layout(push_constant, scalar) uniform P {
 #ifndef PRS
 #define PRS (16u * SST)
 #endif
+// LDS_COPY: onr_frag.glsl's 16x16 tile per subgroup after the body's LDS
+#ifdef LDS_COPY
+#define FRAG_SCR LDS_N
+#if W1
+#define LDS_NF (LDS_N + 256u)
+#elif W2
+#define LDS_NF (LDS_N + 512u)
+#else
+#define LDS_NF (LDS_N + 1024u * SPLIT)
+#endif
+#else
+#define LDS_NF LDS_N
+#endif
 // LDS_MIN (halves): a larger block than the body needs, so fewer workgroups share a compute unit (measurements)
 #ifdef LDS_MIN
-#define LDS_A max(LDS_N, uint(LDS_MIN))
+#define LDS_A max(LDS_NF, uint(LDS_MIN))
 #else
-#define LDS_A LDS_N
+#define LDS_A LDS_NF
 #endif
 shared LdsH { float16_t lds[LDS_A]; };
 shared LdsW { uint lds1[LDS_A / 2u]; };

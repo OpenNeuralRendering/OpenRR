@@ -10,6 +10,10 @@
 #extension GL_GOOGLE_include_directive : require
 #include "onr_common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
+#ifdef D3D_TEX
+#extension GL_EXT_samplerless_texture_functions : require
+layout(set = 0, binding = 0) uniform texture2D tex[16];
+#endif
 #ifdef D3D_UAV
 // d3d_downsample (D3D12 path): the rgba16f output texture itself (descriptor 16 of set 0), dst = origin x | y << 16;
 // the store keeps the bits
@@ -45,6 +49,8 @@ layout(push_constant, scalar) uniform P {
     F16x4Buf op_hist_in; // its history, rgba16f, output size
     F16x4Buf op_hist_out;
     uint op_reset;       // the opacity's history is not used
+    uint tl_view;        // d3d_downsample_tl: the layer read from the game's texture, descriptor tl_view - 1 of set 0; 0 = from tl
+    uint tl_origin;      // that texture's subrect origin x | y << 16
 } pc;
 
 const uint W_ODD[5] = uint[5](0xa8e7u, 0x35f4u, 0x38f6u, 0x2d96u, 0xa94bu);
@@ -127,6 +133,51 @@ vec2 hist_mv(ivec2 n, vec2 al) {
 
 shared f16vec4 hrow[29][16];
 
+// texel p (inside the render size) of the layer, as the ingest writes it into tl: NaN as 0, clamped to half's range
+f16vec4 tl_load(ivec2 p) {
+#ifdef D3D_TEX
+    if (pc.tl_view != 0u) {
+        vec4 c = texelFetch(tex[pc.tl_view - 1u], p + ivec2(pc.tl_origin & 65535u, pc.tl_origin >> 16), 0);
+        return f16vec4(clamp(mix(c, vec4(0.0), isnan(c)), -65504.0, 65504.0));
+    }
+#endif
+    return EL(F16x4Buf, pc.tl, uint(p.y * pc.lr_size.x + p.x), 8u);
+}
+
+#ifdef LT_DS_TLLDS
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// the layer's texels the group reads (the 3x3s and the bilinear taps), clamped to the edge as fetch() clamps them;
+// past 20 x 20 (never at render <= output) the reads stay global
+shared f16vec4 tlt[20][20];
+shared uint tl_wany[8];   // per subgroup: any bit of the tile it loaded (all +0: no pixel of the group passes the 3x3)
+ivec2 tl_org;
+bool tl_lds;
+// n and the bilinear's first tap of output pixel o, as main() computes them
+ivec2 tl_n(ivec2 o) {
+    vec2 fo = vec2(o) + 0.5;
+    return ivec2(round_away(fo.x * pc.scale.x - 0.5 + pc.offset.x), round_away(fo.y * pc.scale.y - 0.5 + pc.offset.y));
+}
+ivec2 tl_i(ivec2 o) { return ivec2(floor((vec2(o) + 0.5 + pc.offset_out) / vec2(pc.out_size) * vec2(pc.lr_size) - 0.5)); }
+#endif
+
+f16vec4 tl_texel(ivec2 p) {
+#ifdef LT_DS_TLLDS
+    if (tl_lds) return tlt[p.y - tl_org.y][p.x - tl_org.x];
+#endif
+    return tl_load(clamp(p, ivec2(0), pc.lr_size - 1));
+}
+
+// bilinear() on the layer
+vec4 bilinear_tl(vec2 uv) {
+    vec2 x = uv * vec2(pc.lr_size) - 0.5;
+    vec2 f0 = floor(x);
+    vec2 f = round((x - f0) * 256.0) / 256.0;
+    ivec2 i = ivec2(f0);
+    vec4 a = mix(vec4(tl_texel(i)), vec4(tl_texel(i + ivec2(1, 0))), f.x);
+    vec4 c = mix(vec4(tl_texel(i + ivec2(0, 1))), vec4(tl_texel(i + ivec2(1, 1))), f.x);
+    return mix(a, c, f.y);
+}
+
 void main() {
     ivec2 o = pc.out_origin + ivec2(gl_GlobalInvocationID.xy);
     int lo = pc.slice_x.x;
@@ -138,6 +189,25 @@ void main() {
     int r1 = clamp(int(floor((float(oy0 + 15) + 0.5) * 1.5)) + 2, 0, pc.in_size.y - 1);
     uint lx = gl_LocalInvocationID.x;
     for (int i = int(gl_LocalInvocationID.y); i <= r1 - r0; i += 16) hrow[i][lx] = f16vec4(hpass(r0 + i, cx, o.x & 1, lo, hi), 0.0hf);
+#ifdef LT_DS_TLLDS
+    {
+        ivec2 g0 = pc.out_origin + ivec2(gl_WorkGroupID.xy) * 16, g1 = g0 + 15;
+        tl_org = min(tl_n(g0), tl_i(g0)) - 1;
+        ivec2 e = max(tl_n(g1) + 1, tl_i(g1) + 1) - tl_org;
+        tl_lds = e.x < 20 && e.y < 20;
+        uint bits = 0u;
+        if (tl_lds)
+            for (uint t = gl_LocalInvocationIndex; t < 400u; t += 256u) {
+                ivec2 q = clamp(tl_org + ivec2(t % 20u, t / 20u), ivec2(0), pc.lr_size - 1);
+                f16vec4 v = tl_load(q);
+                tlt[t / 20u][t % 20u] = v;
+                u16vec4 b = float16BitsToUint16(v);
+                bits |= uint(b.x | b.y | b.z | b.w);
+            }
+        bits = subgroupOr(bits);
+        if (subgroupElect()) tl_wany[gl_SubgroupID] = bits;
+    }
+#endif
     barrier();
     if (o.x >= pc.out_end.x || o.y >= pc.out_end.y || o.x >= pc.out_size.x || o.y >= pc.out_size.y) return;
     precise f16vec3 acc = f16vec3(0.0hf);
@@ -169,12 +239,18 @@ void main() {
     float w = aligned ? pc.weight : pc.weight * pc.weight;
     vec4 lo4 = vec4(fbits(0x7f7fffffu)), hi4 = vec4(fbits(0x00800000u));
     uint nz = 1u;
+#ifdef LT_DS_TLLDS
+    bool tl_zero = tl_lds;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) tl_zero = tl_zero && tl_wany[i] == 0u;
+    if (tl_zero && pc.reset == 0u && uint64_t(pc.op) == 0ul) nz = 0u;
+    else
+#endif
     if (pc.reset == 0u) {
         nz = 0u;
         for (int dy = -1; dy <= 1; ++dy)
             for (int dx = -1; dx <= 1; ++dx) {
                 ivec2 p = n + ivec2(dx, dy);
-                f16vec4 s16 = EL(F16x4Buf, pc.tl, uint(clamp(p.y, 0, pc.lr_size.y - 1) * pc.lr_size.x + clamp(p.x, 0, pc.lr_size.x - 1)), 8u);
+                f16vec4 s16 = tl_texel(p);
                 u16vec4 b = float16BitsToUint16(s16);
                 nz |= uint(b.x | b.y | b.z | b.w);
                 vec4 s = vec4(s16);
@@ -188,7 +264,7 @@ void main() {
     if (has_op) {
         // with the opacity every pixel blends (its 3x3 can be non-zero where the layer's is +0)
         vec2 uv = (fo + pc.offset_out) / vec2(pc.out_size), huv = (vec2(o) + hist_mv(n, al) + 0.5) / vec2(pc.out_size);
-        vec4 cur = bilinear(pc.tl, pc.lr_size, uv);
+        vec4 cur = bilinear_tl(uv);
         cur.rgb *= E;
         vec3 ocur = bilinear(pc.op, pc.lr_size, uv).rgb;
         vec4 h = cur;
@@ -215,7 +291,7 @@ void main() {
     } else if (nz != 0u) {
         // a 3x3 of +0 holds the bilinear's 2x2 too: cur = +0, the history clamps to [+0, FLT_MIN] and (1 - w) * h is
         // denormal, so the history written is +0 and the output is y either way; hist_in and pmv are not read
-        vec4 cur = bilinear(pc.tl, pc.lr_size, (fo + pc.offset_out) / vec2(pc.out_size));
+        vec4 cur = bilinear_tl((fo + pc.offset_out) / vec2(pc.out_size));
         cur.rgb *= E;
         vec4 h = cur;
         if (pc.reset == 0u) {

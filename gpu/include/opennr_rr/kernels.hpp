@@ -34,6 +34,7 @@ struct DownsampleTlPC {
     float tlmv_scale[2] = {};
     uint64_t op = 0, op_hist_in = 0, op_hist_out = 0;
     uint32_t op_reset = 0;
+    uint32_t tl_view = 0, tl_origin = 0;   // d3d_downsample_tl: the layer from the game's texture (descriptor tl_view - 1)
 };
 struct PostTilePC { uint64_t dfn, ajab, aniso, tile; I2 lr_size; int32_t dfn_stride; };
 struct DfnExportPC { uint64_t dfn, exposure, dst; I2 size; int32_t dfn_stride; uint32_t pitch, half_out; };

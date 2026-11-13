@@ -5,8 +5,8 @@
         // Q^T [dim tile][token tile] = in_a x^T, V [token tile][dim tile] = x in_b^T; K = channel tiles in order
         ACC q00 = ACC(0.0), q01 = ACC(0.0), q10 = ACC(0.0), q11 = ACC(0.0), q20 = ACC(0.0), q21 = ACC(0.0), q30 = ACC(0.0), q31 = ACC(0.0);
         ACC v00 = ACC(0.0), v01 = ACC(0.0), v10 = ACC(0.0), v11 = ACC(0.0), v20 = ACC(0.0), v21 = ACC(0.0), v30 = ACC(0.0), v31 = ACC(0.0);
-#define QV_TOK(xt, qa, qb, va, vb) { MB b_; CPB(b_, xt) MMA(qa, wa0, b_) Q2_IF { MMA(qb, wa1, b_) } \
-            MA a_; CPA(a_, xt) MMA(va, a_, wb0) MMA(vb, a_, wb1) }
+#define QV_TOK(xt, qa, qb, va, vb) { MB b_; XPB(b_, xt) MMA(qa, wa0, b_) Q2_IF { MMA(qb, wa1, b_) } \
+            MA a_; XPA(a_, xt) MMA(va, a_, wb0) MMA(vb, a_, wb1) }
 #define QV_K(n, xa, xb, xc, xd) { MA wa0, wa1; MB wb0, wb1; \
             coopMatLoad(wa0, pc.in_a.v, QA_LR(wq + (n) * 16u), ENC_C, ROW); Q2_IF { coopMatLoad(wa1, pc.in_a.v, wq + 16u * ENC_C + (n) * 16u, ENC_C, ROW); } \
             coopMatLoad(wb0, pc.in_b.v, VB_LR(wq + (n) * 16u), ENC_C, COL); coopMatLoad(wb1, pc.in_b.v, VB_LR(wq + 16u * ENC_C + (n) * 16u), ENC_C, COL); \
@@ -47,14 +47,7 @@
                 precise f16vec2 sm = (t0 + t1) + (t2 + t3); \
                 e2[e >> 1] = sm; \
             } \
-            f16vec2 pc2[4]; \
-            [[unroll]] for (int i = 0; i < 4; ++i) { \
-                f16vec2 o = unpackFloat2x16(subgroupShuffleXor(packFloat2x16(e2[i]), 16u)); \
-                precise f16vec2 sp = e2[i] + o; \
-                pc2[i] = sp; \
-            } \
-            precise f16vec2 b2_ = (pc2[0] + pc2[1]) + (pc2[2] + pc2[3]); \
-            precise float16_t sum = b2_.x + b2_.y; \
+            SM_SUM(sum, e2, p0, p1, p2, p3) \
             float16_t r = RCP_SUM(sum); \
             [[unroll]] for (int e = 0; e < 8; e += 2) { \
                 precise f16vec2 u0 = f16vec2(p0[e], p0[e + 1]) * r, u1 = f16vec2(p1[e], p1[e + 1]) * r; \
@@ -93,19 +86,8 @@
 #define E_LO(p, T, K) MH p = MH(0.0); if (KEPT(uint(T), uint(K))) { MA a_; CPA(a_, e##K##T) MMA(p, a_, idb) }
         E_UP(0, 1) E_UP(0, 2) E_UP(0, 3) E_UP(1, 2) E_UP(1, 3) E_UP(2, 3)
 #define ATT_N(r0_, ca0, ca1) { \
-            f16vec2 e2[4]; \
-            [[unroll]] for (int e = 0; e < 8; e += 2) { \
-                precise f16vec2 sm = (f16vec2(p0[e], p0[e + 1]) + f16vec2(p1[e], p1[e + 1])) + (f16vec2(p2[e], p2[e + 1]) + f16vec2(p3[e], p3[e + 1])); \
-                e2[e >> 1] = sm; \
-            } \
-            f16vec2 pc2[4]; \
-            [[unroll]] for (int i = 0; i < 4; ++i) { \
-                f16vec2 o = unpackFloat2x16(subgroupShuffleXor(packFloat2x16(e2[i]), 16u)); \
-                precise f16vec2 sp = e2[i] + o; \
-                pc2[i] = sp; \
-            } \
-            precise f16vec2 b2_ = (pc2[0] + pc2[1]) + (pc2[2] + pc2[3]); \
-            precise float16_t sum = b2_.x + b2_.y; \
+            SM_E2(e2, p0, p1, p2, p3) \
+            SM_SUMR(sum, e2, p0, p1, p2, p3) \
             float16_t r = RCP_SUM(sum); \
             [[unroll]] for (int e = 0; e < 8; e += 2) { \
                 precise f16vec2 u0 = f16vec2(p0[e], p0[e + 1]) * r, u1 = f16vec2(p1[e], p1[e + 1]) * r; \

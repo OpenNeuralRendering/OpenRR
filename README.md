@@ -5,7 +5,7 @@ cards (RDNA4), with kernels written from scratch. It is the Ray Reconstruction r
 inside the [OpenNR OptiScaler fork](https://github.com/MatheusFerreiraS/OpenNR-OptiScaler): when a game asks for DLSS
 Ray Reconstruction, OptiScaler hands the frame to OpenRR.
 
-Version 0.1.5. MIT licence.
+Version 0.1.6. MIT licence.
 
 Discord: <https://discord.gg/wYhvS3JSHM>
 
@@ -13,7 +13,8 @@ Ko-fi: <https://ko-fi.com/T6T213OVFE>
 
 ## Requirements
 
-- An RX 9000 card (RDNA4). Other cards are not supported yet.
+- An RX 9000 card (RDNA4). RX 7000 cards and RDNA3 / RDNA 3.5 graphics (Radeon 780M, 890M, 8060S) are experimental, with kernels
+  built for RDNA3. Other cards are not supported yet.
 - A D3D12 or Vulkan game that uses DLSS Ray Reconstruction.
 - `nvngx_dlssd.dll` 310.9.1. OpenRR builds its weights from this file when the game starts. If the game ships another
   version, Ray Reconstruction stays on FSR-RR.
@@ -22,7 +23,8 @@ Ko-fi: <https://ko-fi.com/T6T213OVFE>
 
 Use the [OpenNR Installer](https://github.com/zmodelerlover/OpenNR-Installer/releases). On the OptiScaler route,
 OpenRR is ticked by default on RX 9000. The installer puts `OpenNrRrRuntime.dll` and `opennr-rr\shaders\` next to
-OptiScaler, and adds NVIDIA's 310.9.1 DLL when the game doesn't have it.
+OptiScaler, and adds NVIDIA's 310.9.1 DLL when the game doesn't have it. On RX 7000 and RDNA3 / RDNA 3.5 graphics it is
+experimental and off unless ticked; those cards also get `opennr-rr\shaders-gfx11\`.
 
 In game, OpenRR settings are in OptiScaler's `[OpenNR-RR]` section and in the upscaler list of the Insert menu.
 
@@ -70,6 +72,13 @@ cmake --build build --config Release --target runtime_stage
 
 `build\stage\` then holds what ships: `OpenNrRrRuntime.dll` and `opennr-rr\shaders\`. The C interface is in
 `runtime\include\opennr_rr_api.h`.
+
+The RX 7000 kernels come from a second build, whose `stage\opennr-rr\shaders\` ships as `opennr-rr\shaders-gfx11\`:
+
+```
+cmake -S gpu -B build-gfx11 -G "Visual Studio 18 2026" -A x64 -DONR_GFX11=ON -DONR_SPLIT_C=128
+cmake --build build-gfx11 --config Release --target runtime_stage
+```
 
 ## Repository layout
 

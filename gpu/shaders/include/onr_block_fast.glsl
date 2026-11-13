@@ -27,6 +27,36 @@
 #endif
 #define NTH (128u * SPLIT)
 #define NSG (4u * SPLIT)
+#include "onr_frag.glsl"
+// XRB (RX 7000 sets): the x^T tiles are kept as B operands. On RDNA3 every accumulator -> B move costs shuffles, and x was
+// moved once per product it feeds; now once per residual. Same values, same products. Not in the W1 decoder _0 (dec0_0):
+// its token tiles were never tested, so its moves were shared already, and the B tiles (twice an accumulator's registers on
+// RDNA3) made it spill
+#ifndef ONR_XRB
+#define ONR_XRB FRAG_ROWS
+#endif
+#define XRB (ONR_XRB && ENC_F32 && !(W1 && DEC_UP))
+#if XRB
+#define XT MB
+#define XPREP(blo, bhi, xn) blo = xn;
+#define XROWS8(t, xn) ROWS8B(t, xn)
+#define XROWSET(xn) ROWB(xn)
+#define RES_IN(a, cn) MB a; { MH c_ = MH(cn); CPB(a, c_) }
+#define XPB(b, xn) b = xn;
+#define XPA(a, xn) CPAB(a, xn)
+#define XREC2(xa, xb, w) REC2B(xa, xb, w)
+#define EMB_X(xa, xb, f0, f1) { MH f_ = MH(f0); CPB(xa, f_) } { MH f_ = MH(f1); CPB(xb, f_) }
+#else
+#define XT MH
+#define XPREP(blo, bhi, xn) BPREP(blo, bhi, xn)
+#define XROWS8(t, xn) ROWS8(t, xn)
+#define XROWSET(xn) ROWH(xn)
+#define RES_IN(a, cn) MH a = MH(cn);
+#define XPB(b, xn) CPB(b, xn)
+#define XPA(a, xn) CPA(a, xn)
+#define XREC2(xa, xb, w) REC2(xa, xb, w)
+#define EMB_X(xa, xb, f0, f1) xa = MH(f0), xb = MH(f1);
+#endif
 
 #if ENC_F32
 // fast variant: one fp32-accumulated WMMA per 16 K, one rounding to fp16 per product (as the store)
@@ -97,8 +127,8 @@
 #define FOR_NT(M) M(c0, TILE(0u)) F1(M) F2(M) F3(M) F4(M) F5(M) F6(M) F7(M) F8(M) F9(M)
 
 // Transposed body (TR, SPLIT 1): every product is computed as its transpose, D^T = W A^T, so the activations
-// are always the B operand. On RDNA4 a 16x16 accumulator copied element by element is the B operand of the
-// same matrix (probe_wmma), so x, Q_h, P, O_h, the MLP hidden slice and the residuals never pass through LDS;
+// are always the B operand. A 16x16 accumulator moves into the B operand of the same matrix in registers (CPB,
+// onr_frag.glsl), so x, Q_h, P, O_h, the MLP hidden slice and the residuals never pass through LDS;
 // only Q_h / V_h of all tokens (the keys) do. Same products, same K order, same roundings as the row body.
 #if TR
 #if NT > 1
@@ -175,10 +205,10 @@
 #define Y9(M)
 // fp16 accumulator -> B operand (k8: B masked to K rows 0..7, then 8..15)
 #if ENC_F32
-#define BPREP(blo, bhi, h) { for (int i_ = 0; i_ < h.length(); ++i_) blo[i_] = h[i_]; }
+#define BPREP(blo, bhi, h) CPB(blo, h)
 #define TSTEP(acc, a, blo, bhi) { acc = coopMatMulAdd(a, blo, acc); }
 #else
-#define BPREP(blo, bhi, h) { MB b_; for (int i_ = 0; i_ < h.length(); ++i_) b_[i_] = h[i_]; blo = b_ * mblo; bhi = b_ * mbhi; }
+#define BPREP(blo, bhi, h) { MB b_; CPB(b_, h) blo = b_ * mblo; bhi = b_ * mbhi; }
 #define TSTEP(acc, a, blo, bhi) { acc = coopMatMulAdd(a, blo, acc); acc = MC(MH(acc)); acc = coopMatMulAdd(a, bhi, acc); acc = MC(MH(acc)); }
 #endif
 #ifndef FP8PROTO
@@ -221,7 +251,7 @@ ACC bias_acc_t(F16Buf b, uint n0) {
 }
 // DFN pre-activations from the x2^T tiles: d^T [16 gains][16 rows] = dfn x2^T + b, stored as the row body's d
 #define DFN_PRE_T if (hf == 0u) { ACC acc = bias_acc_t(pc.dfn_b, 0u); FOR_NX(DFN_T) coopMatStore(MH(acc), lds, pr, 16u, COL); }
-#define DFN_T(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) WSTEP(acc, pc.dfn_w.v, (n) * 16u, ENC_C, blo, bhi) }
+#define DFN_T(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) WSTEP(acc, pc.dfn_w.v, (n) * 16u, ENC_C, blo, bhi) }
 // SPLIT 2: the two subgroups of a row tile both hold all x^T tiles; each accumulates half of the output tiles
 // (own tile i is tile i + NO hf) and they exchange them through XS, one 16x16 block per tile and row tile
 #define NO (NT / SPLIT)
@@ -309,6 +339,14 @@ layout(buffer_reference, scalar, buffer_reference_align = 16) buffer U32x4View {
 #else
 #define XREG_IN 0
 #endif
+// 16 record bytes of a 32-channel plane -> the lane's elements of its two channel tiles, row order (as XIN); REC2B: into
+// two B operands
+#define REC2(xa, xb, w) { ROWV(xa) ROWV(xb) [[unroll]] for (int k_ = 0; k_ < 4; ++k_) { \
+            f16vec2 a_ = unpackFloat2x16(e4m3_lo(w[k_])), b_ = unpackFloat2x16(e4m3_hi(w[k_])); \
+            RT(xa)[2 * k_] = a_.x, RT(xa)[2 * k_ + 1] = a_.y, RT(xb)[2 * k_] = b_.x, RT(xb)[2 * k_ + 1] = b_.y; } ROWH(xa) ROWH(xb) }
+#define REC2B(xa, xb, w) { ROWV(xa) ROWV(xb) [[unroll]] for (int k_ = 0; k_ < 4; ++k_) { \
+            f16vec2 a_ = unpackFloat2x16(e4m3_lo(w[k_])), b_ = unpackFloat2x16(e4m3_hi(w[k_])); \
+            RT(xa)[2 * k_] = a_.x, RT(xa)[2 * k_ + 1] = a_.y, RT(xb)[2 * k_] = b_.x, RT(xb)[2 * k_ + 1] = b_.y; } ROWB(xa) ROWB(xb) }
 
 // e4m3 codes 0, 1 (e4m3_lo) or 2, 3 (e4m3_hi) of w -> two packed fp16, sm_86 expansion (e4m3_in): each code << 8 in
 // its half (one v_perm), then sign | ((code & 0x7f) << 7) + (8 << 10): the arithmetic shift by 1 per half leaves the
@@ -335,6 +373,19 @@ uint e4m3x4(f16vec2 a, f16vec2 b) {
     u8vec4 p = unpack8(u), q = unpack8(v);
     return pack32(u8vec4(p.y, p.w, q.y, q.w));
 }
+
+// TensorOutput store of a lane's two x^T tiles (8 GPU positions each) at element idx of the planes: 16 e4m3 codes, or
+// with Y16 (RX 7000 probe kit v2) the fp16 values in the same order, pc.y twice the size
+#ifdef Y16
+#define YST(idx, xa, xb) { uvec4 w0_, w1_; [[unroll]] for (int k_ = 0; k_ < 2; ++k_) { \
+        w0_[2 * k_] = packFloat2x16(f16vec2(xa[2 * k_], xa[2 * k_ + 1])), w0_[2 * k_ + 1] = packFloat2x16(f16vec2(xb[2 * k_], xb[2 * k_ + 1])); \
+        w1_[2 * k_] = packFloat2x16(f16vec2(xa[2 * k_ + 4], xa[2 * k_ + 5])), w1_[2 * k_ + 1] = packFloat2x16(f16vec2(xb[2 * k_ + 4], xb[2 * k_ + 5])); } \
+        U32x4View(uint64_t(pc.y)).v[2u * ((idx) >> 4)] = w0_; U32x4View(uint64_t(pc.y)).v[2u * ((idx) >> 4) + 1u] = w1_; }
+#else
+#define YST(idx, xa, xb) { uvec4 w_; [[unroll]] for (int k_ = 0; k_ < 4; ++k_) \
+        w_[k_] = e4m3x4(f16vec2(xa[2 * k_], xa[2 * k_ + 1]), f16vec2(xb[2 * k_], xb[2 * k_ + 1])); \
+        U32x4View(uint64_t(pc.y)).v[(idx) >> 4] = w_; }
+#endif
 
 // arena channels a .. a + 15 (a % 16 == 0) sit at two runs of 8 GPU positions of the row: g .. g + 7 (bytes 0, 1 of
 // each u32) and g + 16 .. g + 23 (bytes 2, 3); put16 / get16 move them as two 16-byte LDS accesses
@@ -530,13 +581,13 @@ void main() {
     // x^T = fma(skip, s, U) per lane: the skip's record bytes as in XIN, U of the token from QV
         float16_t sc = uint16BitsToFloat16(uint16_t(pc.s_skip));
         uint t_ = r0 + (ln & 15u), ub_ = UPU + ((((t_ >> 3) & 1u) << 1) + (t_ & 1u)) * 16u * ENC_C + (((t_ >> 4) << 2) + ((t_ & 7u) >> 1)) * ENC_C + 8u * hh;
-#define XUP(xa, xb, pl) MH xa, xb; { uvec4 w_ = U32x4View(uint64_t(pc.x)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4]; \
+#define XUP(xa, xb, pl) XT xa, xb; { ROWV(xa) ROWV(xb) uvec4 w_ = U32x4View(uint64_t(pc.x)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4]; \
         uint ua_ = (ub_ + (pl) * 32u) >> 1, ub2_ = ua_ + 8u; \
         [[unroll]] for (int k_ = 0; k_ < 4; ++k_) { \
             f16vec2 a_ = unpackFloat2x16(e4m3_lo(w_[k_])), b_ = unpackFloat2x16(e4m3_hi(w_[k_])); \
             f16vec2 ua = unpackFloat2x16(lds1[ua_ + uint(k_)]), ubv = unpackFloat2x16(lds1[ub2_ + uint(k_)]); \
             precise f16vec2 za = fma(a_, f16vec2(sc), ua), zb = fma(b_, f16vec2(sc), ubv); \
-            xa[2 * k_] = za.x, xa[2 * k_ + 1] = za.y, xb[2 * k_] = zb.x, xb[2 * k_ + 1] = zb.y; } }
+            RT(xa)[2 * k_] = za.x, RT(xa)[2 * k_ + 1] = za.y, RT(xb)[2 * k_] = zb.x, RT(xb)[2 * k_ + 1] = zb.y; } XROWSET(xa) XROWSET(xb) }
         XUP(x0, x1, 0u)
 #if NT > 2
         XUP(x2, x3, 1u)
@@ -652,10 +703,10 @@ void main() {
 #endif
 #elif XREG_IN
     // own tokens, e4m3 -> fp16, one 16-byte load per lane and plane into the x^T tiles
-#define XIN(xa, xb, pl) MH xa, xb; { uvec4 w_ = U32x4View(uint64_t(pc.x)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4]; \
+#define XIN(xa, xb, pl) XT xa, xb; { ROWV(xa) ROWV(xb) uvec4 w_ = U32x4View(uint64_t(pc.x)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4]; \
         [[unroll]] for (int k_ = 0; k_ < 4; ++k_) { \
             f16vec2 a_ = unpackFloat2x16(e4m3_lo(w_[k_])), b_ = unpackFloat2x16(e4m3_hi(w_[k_])); \
-            xa[2 * k_] = a_.x, xa[2 * k_ + 1] = a_.y, xb[2 * k_] = b_.x, xb[2 * k_ + 1] = b_.y; } }
+            RT(xa)[2 * k_] = a_.x, RT(xa)[2 * k_ + 1] = a_.y, RT(xb)[2 * k_] = b_.x, RT(xb)[2 * k_ + 1] = b_.y; } XROWSET(xa) XROWSET(xb) }
 #if FP8QV
     // and the same bytes as e4m3 B tiles (OCP codes)
 #define XIN8(xa, xb, ya, yb, pl) XIN(xa, xb, pl) QB8 ya, yb; { uvec4 w_ = U32x4View(uint64_t(pc.x)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4];         [[unroll]] for (int k_ = 0; k_ < 4; ++k_) { uint o_ = ocp4(w_[k_]);             ya[2 * k_] = uintBitsToFloate4m3EXT(uint8_t(o_ & 0xffu)), ya[2 * k_ + 1] = uintBitsToFloate4m3EXT(uint8_t((o_ >> 8) & 0xffu));             yb[2 * k_] = uintBitsToFloate4m3EXT(uint8_t((o_ >> 16) & 0xffu)), yb[2 * k_ + 1] = uintBitsToFloate4m3EXT(uint8_t(o_ >> 24)); } }
@@ -690,7 +741,7 @@ void main() {
 
 #if TR
     // x^T of the own rows: NT tiles [16 channels][16 rows] in registers
-#define LOAD_XT(cn, xn, n) MH xn; coopMatLoad(xn, lds, XS + r0 * ENC_C + (n) * 16u, ENC_C, COL);
+#define LOAD_XT(cn, xn, n) XT xn; coopMatLoad(xn, lds, XS + r0 * ENC_C + (n) * 16u, ENC_C, COL);
 #if !ENC_EMBED && !XREG_IN
     FOR_NX(LOAD_XT)
 #endif
@@ -719,7 +770,7 @@ void main() {
 #else
             F16Buf wqv = F16Buf(hf == 0u ? uint64_t(pc.in_a) : uint64_t(pc.in_b));
             ACC a0 = ACC(0.0), a1 = ACC(0.0);
-#define QV_T2(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn)             WSTEP(a0, wqv.v, hd * 32u * ENC_C + (n) * 16u, ENC_C, blo, bhi) WSTEP(a1, wqv.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C, blo, bhi) }
+#define QV_T2(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn)             WSTEP(a0, wqv.v, hd * 32u * ENC_C + (n) * 16u, ENC_C, blo, bhi) WSTEP(a1, wqv.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C, blo, bhi) }
             FOR_NX(QV_T2)
 #endif
             qh0 = MH(a0), qh1 = MH(a1);
@@ -739,18 +790,18 @@ void main() {
         FOR_NY(QV_T8)
 #else
         ACC q0 = ACC(0.0), q1 = ACC(0.0), v0 = ACC(0.0), v1 = ACC(0.0);
-#define QV_T(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) \
+#define QV_T(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) \
             WSTEP(q0, pc.in_a.v, hd * 32u * ENC_C + (n) * 16u, ENC_C, blo, bhi) WSTEP(q1, pc.in_a.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C, blo, bhi) \
             WSTEP(v0, pc.in_b.v, hd * 32u * ENC_C + (n) * 16u, ENC_C, blo, bhi) WSTEP(v1, pc.in_b.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C, blo, bhi) }
 #if VROW
         // V_h not transposed: x as the A operand (the x^T tile copied), W_v^T as B; V [rows][dims] stored COL is V_h^T
 #if ENC_F32
-#define XA(alo, ahi, xn) { for (int i_ = 0; i_ < xn.length(); ++i_) alo[i_] = xn[i_]; }
+#define XA(alo, ahi, xn) XPA(alo, xn)
 #else
-#define XA(alo, ahi, xn) { MA a_; for (int i_ = 0; i_ < xn.length(); ++i_) a_[i_] = xn[i_]; alo = a_ * mlo; ahi = a_ * mhi; }
+#define XA(alo, ahi, xn) { MA a_; CPA(a_, xn) alo = a_ * mlo; ahi = a_ * mhi; }
 #endif
 #undef QV_T
-#define QV_T(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) \
+#define QV_T(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) \
             WSTEP(q0, pc.in_a.v, hd * 32u * ENC_C + (n) * 16u, ENC_C, blo, bhi) WSTEP(q1, pc.in_a.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C, blo, bhi) \
             MA alo, ahi; XA(alo, ahi, xn) \
             GSTEP(v0, alo, ahi, pc.in_b.v, hd * 32u * ENC_C + (n) * 16u, ENC_C) GSTEP(v1, alo, ahi, pc.in_b.v, (hd * 32u + 16u) * ENC_C + (n) * 16u, ENC_C) }
@@ -795,9 +846,9 @@ void main() {
             IFK(rt, 0u) { WSTEP(s0, lds, qb + 16u, QST, blo, bhi) } IFK(rt, 1u) { WSTEP(s1, lds, qb + 16u * QST + 16u, QST, blo, bhi) }
             IFK(rt, 2u) { WSTEP(s2, lds, qb + 32u * QST + 16u, QST, blo, bhi) } IFK(rt, 3u) { WSTEP(s3, lds, qb + 48u * QST + 16u, QST, blo, bhi) }
         }
-        // softmax in registers. Lane (h, row) holds keys 16 kt + 8 h + e of tile kt, element e: column class e,
+        // softmax in registers. On RDNA4 lane (h, row) holds keys 16 kt + 8 h + e of tile kt, element e: column class e,
         // group a = 2 kt + h. Per class: ((a0 + a2) + (a4 + a6)) + ((a1 + a3) + (a5 + a7)), the even groups in
-        // lane half 0; then (P0 + P2) + (P4 + P6) and (P1 + P3) + (P5 + P7), as the row body
+        // lane half 0; then (P0 + P2) + (P4 + P6) and (P1 + P3) + (P5 + P7), as the row body (SM_SUM: on RDNA3 too)
         MH p0 = MH(s0), p1 = MH(s1), p2 = MH(s2), p3 = MH(s3);
 #ifndef PROF_NOSM
         f16vec2 e2[4];
@@ -811,14 +862,7 @@ void main() {
             precise f16vec2 sm = (t0 + t1) + (t2 + t3);
             e2[e >> 1] = sm;
         }
-        f16vec2 pc2[4];
-        [[unroll]] for (int i = 0; i < 4; ++i) {
-            f16vec2 o = unpackFloat2x16(subgroupShuffleXor(packFloat2x16(e2[i]), 16u));
-            precise f16vec2 sp = e2[i] + o;
-            pc2[i] = sp;
-        }
-        precise f16vec2 b2_ = (pc2[0] + pc2[1]) + (pc2[2] + pc2[3]);
-        precise float16_t sum = b2_.x + b2_.y;
+        SM_SUM(sum, e2, p0, p1, p2, p3)
         float16_t r = RCP_SUM(sum);
         [[unroll]] for (int e = 0; e < 8; e += 2) {
             precise f16vec2 u0 = f16vec2(p0[e], p0[e + 1]) * r, u1 = f16vec2(p1[e], p1[e + 1]) * r;
@@ -857,11 +901,11 @@ void main() {
     }
     CUT(3)
     // x1 = fma(O out^T + b, ls1, x)
-#define RESID_T(cn, xn, l) { MH a16 = MH(cn); for (int i = 0; i < a16.length(); i += 2) { \
+#define RESID_T(cn, xn, l) { RES_IN(a16, cn) for (int i = 0; i < a16.length(); i += 2) { \
         precise f16vec2 v = fma(f16vec2(a16[i], a16[i + 1]), f16vec2(l), f16vec2(xn[i], xn[i + 1])); xn[i] = v.x, xn[i + 1] = v.y; } }
 #if SPLIT == 2
     // own output tiles -> XS, then every tile back from both halves: x1 = fma(O out^T + b, ls1, x)
-#define RESID_X(cn, xn, n, l) { MH a16; coopMatLoad(a16, lds, EXB(n), 16u, ROW); for (int i = 0; i < a16.length(); i += 2) {         precise f16vec2 v = fma(f16vec2(a16[i], a16[i + 1]), f16vec2(l), f16vec2(xn[i], xn[i + 1])); xn[i] = v.x, xn[i + 1] = v.y; } }
+#define RESID_X(cn, xn, n, l) { XT a16; coopMatLoad(a16, lds, EXB(n), 16u, ROW); for (int i = 0; i < a16.length(); i += 2) {         precise f16vec2 v = fma(f16vec2(a16[i], a16[i + 1]), f16vec2(l), f16vec2(xn[i], xn[i + 1])); xn[i] = v.x, xn[i + 1] = v.y; } }
     FOR_NO(EX_ST)
     WG_SYNC();
 #define X1_X(cn, xn, n) RESID_X(cn, xn, n, ls1)
@@ -874,7 +918,7 @@ void main() {
     for (uint j = 0u; j < LT_HID; j += 32u) {
         uint jt = j + 16u * hf;
         ACC h0 = bias_acc_t(pc.fc1_b, jt);
-#define FC1_T2(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) WSTEP(h0, pc.fc1.v, WT_FC1(jt * ENC_C + (n) * 16u), WS_FC1, blo, bhi) }
+#define FC1_T2(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) WSTEP(h0, pc.fc1.v, WT_FC1(jt * ENC_C + (n) * 16u), WS_FC1, blo, bhi) }
         FOR_NX(FC1_T2)
         MH g = MH(h0);
         for (int i = 0; i < g.length(); i += 2) { f16vec2 q = gelu2(f16vec2(g[i], g[i + 1])); g[i] = q.x, g[i + 1] = q.y; }
@@ -911,11 +955,11 @@ void main() {
         ACC h0 = bias_acc_t(pc.fc1_b, j), h1 = bias_acc_t(pc.fc1_b, j + 16u);
 #if MLP64
         ACC h2 = bias_acc_t(pc.fc1_b, j + 32u), h3 = bias_acc_t(pc.fc1_b, j + 48u);
-#define FC1_T(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) \
+#define FC1_T(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) \
             WSTEP(h0, pc.fc1.v, WT_FC1(j * ENC_C + (n) * 16u), WS_FC1, blo, bhi) WSTEP(h1, pc.fc1.v, WT_FC1((j + 16u) * ENC_C + (n) * 16u), WS_FC1, blo, bhi) \
             WSTEP(h2, pc.fc1.v, WT_FC1((j + 32u) * ENC_C + (n) * 16u), WS_FC1, blo, bhi) WSTEP(h3, pc.fc1.v, WT_FC1((j + 48u) * ENC_C + (n) * 16u), WS_FC1, blo, bhi) }
 #else
-#define FC1_T(cn, xn, n) { MBP blo, bhi; BPREP(blo, bhi, xn) \
+#define FC1_T(cn, xn, n) { MBP blo, bhi; XPREP(blo, bhi, xn) \
             WSTEP(h0, pc.fc1.v, WT_FC1(j * ENC_C + (n) * 16u), WS_FC1, blo, bhi) WSTEP(h1, pc.fc1.v, WT_FC1((j + 16u) * ENC_C + (n) * 16u), WS_FC1, blo, bhi) }
 #endif
         FOR_NX(FC1_T)
@@ -939,9 +983,11 @@ void main() {
 #endif
 #if !DEC_HEAD
     // TensorOutput of the own tokens straight from the x^T tiles, one 16-byte store per lane and plane
-#define XOUT(xa, xb, pl) if (town && (SPLIT == 1 || ((pl) & 1u) == hf)) { uvec4 w_; [[unroll]] for (int k_ = 0; k_ < 4; ++k_) \
-        w_[k_] = e4m3x4(f16vec2(xa[2 * k_], xa[2 * k_ + 1]), f16vec2(xb[2 * k_], xb[2 * k_ + 1])); \
-        U32x4View(uint64_t(pc.y)).v[plane_index(tp, int(pl) * 32 + int(hh) * 16) >> 4] = w_; }
+#if FRAG_ROWS
+#define XOUT(xa, xb, pl) if (SPLIT == 1 || ((pl) & 1u) == hf) { XROWS8(ta_, xa) XROWS8(tb_, xb) if (town) YST(plane_index(tp, int(pl) * 32 + int(hh) * 16), ta_, tb_) }
+#else
+#define XOUT(xa, xb, pl) if (town && (SPLIT == 1 || ((pl) & 1u) == hf)) YST(plane_index(tp, int(pl) * 32 + int(hh) * 16), xa, xb)
+#endif
     XOUT(x0, x1, 0u)
 #if NT > 2
     XOUT(x2, x3, 1u)
@@ -964,7 +1010,12 @@ void main() {
 #if XPERM
     // token (ty, tx) to row 16 q + r, q = 2 (ty & 1) + (tx & 1) the tap, r = 4 (ty >> 1) + (tx >> 1) the pooled pixel
     uint tk_ = r0 + (ln & 15u), xr_ = XS + (16u * (2u * ((tk_ >> 3) & 1u) + (tk_ & 1u)) + 4u * (tk_ >> 4) + ((tk_ & 7u) >> 1)) * ENC_C + 8u * hh;
+#if FRAG_ROWS
+#define STORE_XT(cn, xn, n) if (SPLIT == 1 || ((n) & 1u) == hf) { XROWS8(t_, xn) lds4[(xr_ + (n) * 16u) >> 3] = uvec4(packFloat2x16(f16vec2(t_[0], t_[1])), \
+        packFloat2x16(f16vec2(t_[2], t_[3])), packFloat2x16(f16vec2(t_[4], t_[5])), packFloat2x16(f16vec2(t_[6], t_[7]))); }
+#else
 #define STORE_XT(cn, xn, n) if (SPLIT == 1 || ((n) & 1u) == hf) lds4[(xr_ + (n) * 16u) >> 3] = uvec4(packFloat2x16(f16vec2(xn[0], xn[1])),         packFloat2x16(f16vec2(xn[2], xn[3])), packFloat2x16(f16vec2(xn[4], xn[5])), packFloat2x16(f16vec2(xn[6], xn[7])));
+#endif
 #else
 #define STORE_XT(cn, xn, n) if (SPLIT == 1 || ((n) & 1u) == hf) coopMatStore(xn, lds, XS + r0 * ENC_C + (n) * 16u, ENC_C, COL);
 #endif

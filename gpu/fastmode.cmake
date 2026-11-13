@@ -22,7 +22,7 @@ set(LT_DEFS_dec_up_96_128_128 LT_EXP=1 LT_RCP=1 LT_HM=1)
 set(LT_DEFS_dec_dfn_96_128 LT_EXP=1 LT_RCP=1 LT_HM=1)
 set(LT_DEFS_dec_up_64_64_96 LT_UP8=1 LT_EXP=1 LT_RCP=1 LT_HM=1)
 set(LT_DEFS_dec_dfn_64_64 LT_EXP=1 LT_RCP=1 LT_HM=1)
-set(LT_DEFS_downsample_tl LT_DS_LOAD=1 LT_DS_FAST=1)
+set(LT_DEFS_downsample_tl LT_DS_LOAD=1 LT_DS_FAST=1 LT_DS_TLLDS=1)
 set(LT_DEFS_dfn_export LT_DFN_LOAD=1)
 set(LT_DEFS_dfn_import LT_DFN_LOAD=1)
 # The deep levels from an earlier frame while the mode is on (Engine::set_deep): "mode,level,period,guard". Empty: off.

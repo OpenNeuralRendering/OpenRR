@@ -107,6 +107,19 @@ float sqrt_c(float x) {
 
 ivec2 clampi(ivec2 p, ivec2 sz) { return clamp(p, ivec2(0), sz - 1); }
 uint pix(ivec2 p) { return uint(p.y * pc.size.x + p.x); }
+// the disocclusion mask and the SSS guide (r32f): a buffer, or with bit 63 the game's view (index in bits 0..7, origin
+// x | y << 16 in bits 8..39) through the ingest's conversion (NaN -> 0, with bit 40 clamped to 0..1)
+float opt_r32(uint64_t a, ivec2 p) {
+#ifdef D3D_GUIDES
+    if ((a >> 63) != 0ul) {
+        uint o = uint(a >> 8);
+        float v = texelFetch(tex[uint(a) & 255u], ivec2(o & 65535u, o >> 16) + p, 0).x;
+        v = isnan(v) ? 0.0 : v;
+        return ((a >> 40) & 1ul) != 0ul ? clamp(v, 0.0, 1.0) : v;
+    }
+#endif
+    return AT32(F32Buf, a, pix(p), 4u).v[0];
+}
 
 #ifdef D3D_GUIDES
 vec3 col_at(ivec2 p) { return vec3(g_rgba16f(pc.gt, GS_COLOR, clampi(p, pc.size), pc.size.x).xyz); }
@@ -470,7 +483,7 @@ void main() {
     precise float m1 = fma(d0, d0, d1 * d1), m2 = fma(d2, d2, d3 * d3);
     precise float l1 = m1 > 0.0 ? sqrt_c(m1) + 1.0 : 1.0, l2 = m2 > 0.0 ? sqrt_c(m2) + 1.0 : 1.0;
     // the disocclusion mask's red channel goes into both logs (0 without one: l + 0 is l)
-    float dm = uint64_t(pc.disocc) != 0ul ? AT32(F32Buf, pc.disocc, pix(X), 4u).v[0] : 0.0;
+    float dm = uint64_t(pc.disocc) != 0ul ? opt_r32(uint64_t(pc.disocc), X) : 0.0;
     precise float lm1 = dm + l1, lm2 = dm + l2;
     precise float mvlog = (log2(lm1) * 0.69314718246459960938) * C(0x3a0);
     precise float rflog = (log2(lm2) * 0.69314718246459960938) * C(0x3a0);
@@ -590,7 +603,7 @@ void main() {
     [[unroll]] for (uint k = 30u; k < 34u; ++k) put(base, k, 0.0);
     // 31: the SSS guide, exposed, as a signed log clamped to +-8 (NaN 0)
     if (uint64_t(pc.sss) != 0ul) {
-        precise float v = expo * AT32(F32Buf, pc.sss, pix(X), 4u).v[0];
+        precise float v = expo * opt_r32(uint64_t(pc.sss), X);
         precise float s = (log2(fma(abs(v), 100.0, 1.0)) * 0.30103000998497009277) * (v >= 0.0 ? 0.36000001430511474609 : -0.36000001430511474609);
         put(base, 31u, isnan(s) ? 0.0 : clamp(s, -8.0, 8.0));
     }

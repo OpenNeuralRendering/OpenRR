@@ -20,6 +20,8 @@ struct EngineFrame {
     float depth_sign = 1;       // the depth guide holds view z * depth_sign (linear, positive ahead)
     bool reset = false;
     uint64_t transparency = 0;   // the transparency layer, rgba16f at the render size; 0 = none
+    // or, D3D12 with the output written in place, read from the game's texture: descriptor transparency_view - 1, origin x | y << 16
+    uint32_t transparency_view = 0, transparency_origin = 0;
     // DLSS.DisocclusionMask and the SSS guide (or ColorBeforeFog), r32f at the render size; 0 = none (rr2_enc0 slots 336 / 288)
     uint64_t disocclusion = 0, sss = 0;
     // more of rr2_enc0's optional guides, at the render size; 0 = none (docs/NOTA-ENTRADAS.md): DLSSD.ResponsivityMask

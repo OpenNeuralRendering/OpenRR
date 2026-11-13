@@ -24,6 +24,34 @@ set(FLOW_KERNELS enc_stage_96_128_128 enc_stage_128_128_160 enc_stage_160_256_16
 # the user's "Fast mode" (docs/FASE24-FASTMODE.md): each listed kernel again with these defines, suffix _lt beside the file
 # it replaces. Engine::set_lite loads whichever exist, so removing a file from the stage stops the ladder at that cut.
 include(${CMAKE_CURRENT_SOURCE_DIR}/fastmode.cmake)
+# every kernel without FP8 products (RX 7000 probe, tools/rdna3probe): FP8QV off, LT_UP8 / LT_MI8 left out of the modes
+option(ONR_FP16_ONLY "kernels without FP8 cooperative matrices" OFF)
+# RX 7000 / RDNA 3.5 (shaders/include/onr_frag.glsl): single fragment elements moved in RDNA3's register layout
+# (ONR_GFX11), or through the LDS on any layout (ONR_LDS_COPY, the reference); both FP16 only
+option(ONR_GFX11 "kernels for RDNA3's fragment layout" OFF)
+option(ONR_LDS_COPY "kernels that move single fragment elements through the LDS" OFF)
+set(GLSL_EXTRA)
+if(ONR_GFX11)
+    set(ONR_FP16_ONLY ON)
+    list(APPEND GLSL_EXTRA -DONR_GFX11=1)
+elseif(ONR_LDS_COPY)
+    set(ONR_FP16_ONLY ON)
+    list(APPEND GLSL_EXTRA -DLDS_COPY=1)
+endif()
+# RX 7000 sets: two subgroups per row tile from this C up (onr_block.glsl SPLIT_C, 160 when empty)
+set(ONR_SPLIT_C "" CACHE STRING "first C with two subgroups per row tile")
+if(ONR_SPLIT_C)
+    list(APPEND GLSL_EXTRA -DSPLIT_C=${ONR_SPLIT_C})
+endif()
+if(ONR_FP16_ONLY)
+    list(APPEND GLSL_EXTRA -DFP8QV=0)
+    get_cmake_property(vars VARIABLES)
+    foreach(v ${vars})
+        if(v MATCHES "^L[TX]_DEFS_")
+            list(REMOVE_ITEM ${v} LT_UP8=1 LT_MI8=1)
+        endif()
+    endforeach()
+endif()
 option(ONR_F_SYM "LT_SYM in the Legacy C = 32 kernels: the same output bits with fewer products" ON)
 # a define of the mode that changes what the engine launches, not only a kernel
 if("LT_ATTR_NODS2=1" IN_LIST LT_DEFS_enc0_attr)
@@ -33,7 +61,7 @@ function(lite_spv out_name src)
     set(spvl ${SPV_DIR}/${out_name}${LITE_SUFFIX}.spv)
     add_custom_command(OUTPUT ${spvl}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-        COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${ARGN} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvl} ${src}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} ${ARGN} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvl} ${src}
         DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
     set(LITE_SPVS ${LITE_SPVS} ${spvl} PARENT_SCOPE)
 endfunction()
@@ -91,7 +119,7 @@ foreach(src ${SHADERS})
     set(spv ${SPV_DIR}/${name}.spv)
     add_custom_command(OUTPUT ${spv}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-        COMMAND ${GLSLANG} -V --target-env vulkan1.3 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spv} ${src}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spv} ${src}
         DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
     list(APPEND SPVS ${spv})
     # k8 network kernels also built with the exact scalar P.V chain (ENC_PVX), suffix _x
@@ -99,14 +127,14 @@ foreach(src ${SHADERS})
         set(spvx ${SPV_DIR}/${name}_x.spv)
         add_custom_command(OUTPUT ${spvx}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_PVX=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvx} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_PVX=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvx} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvx})
         # and with every product as the exact scalar HMMA chain (ENC_EXACT, validation only), suffix _e
         set(spve ${SPV_DIR}/${name}_e.spv)
         add_custom_command(OUTPUT ${spve}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_EXACT=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spve} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_EXACT=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spve} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spve})
         # and the fast variant: fp32 accumulation over the whole K of each product (ENC_F32), suffix _f
@@ -119,7 +147,7 @@ foreach(src ${SHADERS})
         set(spvf ${SPV_DIR}/${name}_f.spv)
         add_custom_command(OUTPUT ${spvf}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 ${fsym} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_F32=1 ${fsym} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvf})
         if(NOT name MATCHES "^enc_block_")
@@ -137,7 +165,7 @@ foreach(src ${SHADERS})
             set(spvl ${SPV_DIR}/${name}_fl.spv)
             add_custom_command(OUTPUT ${spvl}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-                COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -DFLOW=1 -DFLOW_SLOT=${slot} -DFLOW_WAIT=${fw} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvl} ${src}
+                COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_F32=1 -DFLOW=1 -DFLOW_SLOT=${slot} -DFLOW_WAIT=${fw} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvl} ${src}
                 DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
             list(APPEND SPVS ${spvl})
             list(APPEND RUNTIME_SPVS ${spvl})
@@ -149,7 +177,7 @@ foreach(src ${SHADERS})
         set(spvd ${SPV_DIR}/d3d_${name}.spv)
         add_custom_command(OUTPUT ${spvd}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DD3D_TEX=1 -DD3D_UAV=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvd} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DD3D_TEX=1 -DD3D_UAV=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvd} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvd})
         list(APPEND RUNTIME_SPVS ${spvd})
@@ -163,7 +191,7 @@ foreach(src ${SHADERS})
         endif()
         add_custom_command(OUTPUT ${spvd}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DD3D_GUIDES=1 -DENC_F32=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvd} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DD3D_GUIDES=1 -DENC_F32=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvd} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvd})
         list(APPEND RUNTIME_SPVS ${spvd})
@@ -173,7 +201,7 @@ foreach(src ${SHADERS})
         set(spvf ${SPV_DIR}/${name}_f.spv)
         add_custom_command(OUTPUT ${spvf}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_F32=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvf} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvf})
         list(APPEND RUNTIME_SPVS ${spvf})
@@ -188,7 +216,7 @@ foreach(src ${SHADERS})
         set(spvw ${SPV_DIR}/${name}_f_w.spv)
         add_custom_command(OUTPUT ${spvw}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-            COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DENC_F32=1 -DATTR_WIDE=1 ${fsymw} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DENC_F32=1 -DATTR_WIDE=1 ${fsymw} -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
             DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
         list(APPEND SPVS ${spvw})
         list(APPEND RUNTIME_SPVS ${spvw})
@@ -196,7 +224,7 @@ foreach(src ${SHADERS})
             set(spvw ${SPV_DIR}/d3d_enc0_attr_f_w.spv)
             add_custom_command(OUTPUT ${spvw}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${SPV_DIR}
-                COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DD3D_GUIDES=1 -DENC_F32=1 -DATTR_WIDE=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
+                COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${GLSL_EXTRA} -DD3D_GUIDES=1 -DENC_F32=1 -DATTR_WIDE=1 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders/include -o ${spvw} ${src}
                 DEPENDS ${src} ${SHADER_INCLUDES} VERBATIM)
             list(APPEND SPVS ${spvw})
             list(APPEND RUNTIME_SPVS ${spvw})

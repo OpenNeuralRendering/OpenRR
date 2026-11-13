@@ -83,6 +83,12 @@ bool Device::init(std::string& err, const DeviceOptions& opt) {
                 break;
             }
         }
+        // no discrete AMD GPU: an AMD APU (Radeon 780M / 890M / 8060S) before anything else
+        for (auto d : devs) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(d, &p);
+            if (!phys_ && !opt.luid && p.vendorID == 0x1002) phys_ = d;
+        }
         if (!phys_ && n && !opt.luid) phys_ = devs[0];
         if (!phys_) throw std::runtime_error(opt.luid ? "no Vulkan device with the adapter's LUID" : "no Vulkan device");
 
@@ -90,6 +96,7 @@ bool Device::init(std::string& err, const DeviceOptions& opt) {
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
         vkGetPhysicalDeviceProperties2(phys_, &p2);
         info_.name = p2.properties.deviceName;
+        info_.vendor = p2.properties.vendorID;
         info_.driver_version = p2.properties.driverVersion;
         info_.driver_info = drv.driverInfo;
         ts_period_ns_ = p2.properties.limits.timestampPeriod;
@@ -256,6 +263,7 @@ bool Device::adopt(const HostDevice& h, std::string& err) {
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
         vkGetPhysicalDeviceProperties2(phys_, &p2);
         info_.name = p2.properties.deviceName;
+        info_.vendor = p2.properties.vendorID;
         info_.driver_version = p2.properties.driverVersion;
         info_.driver_info = drv.driverInfo;
         ts_period_ns_ = p2.properties.limits.timestampPeriod;
@@ -449,6 +457,7 @@ Kernel Device::load(const std::string& path, uint32_t subgroup) {
     }
     k.views = std::filesystem::path(path).stem().string().rfind("d3d_", 0) == 0;
     cpi.layout = k.views ? d3d_layout_ : layout_;
+    cpi.flags = pipeline_flags;
     if (stats_) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     const char* isa = stats_ ? getenv("ONR_ISA") : nullptr;   // directory: dump the driver's internal representations
     if (isa) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;

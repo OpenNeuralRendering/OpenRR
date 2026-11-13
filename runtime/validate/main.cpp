@@ -289,6 +289,8 @@ int wmain(int argc, wchar_t** argv) {
         std::map<uint64_t, HostTimes> path_times;   // by network frame: inputs start / end, output start / end
         double enqueue_cpu = 0;
         int enqueue_n = 0;
+        double record_cpu = 0;   // Record's own time on the CPU
+        int record_n = 0;
 
         const char* be = getenv("ONR_VALIDATE_BACKEND");
         const uint32_t choice = !be ? ONR_RR_BACKEND_CHOICE_VULKAN : !_stricmp(be, "d3d12") ? ONR_RR_BACKEND_CHOICE_D3D12
@@ -665,6 +667,13 @@ int wmain(int argc, wchar_t** argv) {
                 if (re9) d = to_re9(i, d, f);
                 UINT pitch = (RW * gs[i].bpp + 255) & ~255u;
                 for (UINT y = 0; y < RH; ++y) memcpy(um + up_stride * i + UINT64(y) * pitch, d.data() + size_t(y) * RW * gs[i].bpp, size_t(RW) * gs[i].bpp);
+                // ONR_VALIDATE_NAN=1: every 997th texel of the colour and the motion vectors (fp16) as NaN; =2 every other one
+                // as inf, as the Vulkan validator's ONR_VALIDATE_POISON does
+                if (const char* nv = getenv("ONR_VALIDATE_NAN"); nv && (i == 0 || i == 6) && gs[i].bpp % 2 == 0)
+                    for (size_t k = 0; k < size_t(RW) * RH; k += 997) {
+                        const uint16_t v = atoi(nv) == 2 && (k / 997) & 1 ? 0x7C00 : 0x7E00;
+                        memcpy(um + up_stride * i + UINT64(k / RW) * pitch + (k % RW) * gs[i].bpp, &v, 2);
+                    }
                 D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
                 b.Transition = {tex[i].res, 0, SRV, D3D12_RESOURCE_STATE_COPY_DEST};
                 cl[0]->ResourceBarrier(1, &b);
@@ -817,7 +826,12 @@ int wmain(int argc, wchar_t** argv) {
                 // the whole frame on the game's list; a hop stops at the image, the host's list, the rest on the second list
                 OnrRrDenoisedImage im{sizeof im};
                 if (half) im.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                if (a4.Record(ctx, &fr, cl[0], edit > 0 ? uint32_t(edit) : 0u, edit > 0 ? &im : nullptr, &job)) {
+                LARGE_INTEGER r0, r1;
+                QueryPerformanceCounter(&r0);
+                const int32_t rrc = a4.Record(ctx, &fr, cl[0], edit > 0 ? uint32_t(edit) : 0u, edit > 0 ? &im : nullptr, &job);
+                QueryPerformanceCounter(&r1);
+                record_cpu += double(r1.QuadPart - r0.QuadPart) * 1000.0 / double(qpf.QuadPart), ++record_n;
+                if (rrc) {
                     api.GetLastError(err, sizeof err);
                     throw std::runtime_error(std::string("Record: ") + err);
                 }
@@ -1067,6 +1081,7 @@ int wmain(int argc, wchar_t** argv) {
             const char* ld = getenv("ONR_VALIDATE_LOOP_DUMP");
             const char* ldc = ld ? strrchr(ld, ',') : nullptr;
             const int ldn = ldc ? atoi(ldc + 1) : 0;
+            record_cpu = 0, record_n = 0;
             for (int i = 0, n = atoi(lp); i < n; ++i) {
                 if (cycle) run_frame(i % nframes);
                 else run_frame(nframes - 1, false);
@@ -1135,6 +1150,7 @@ int wmain(int argc, wchar_t** argv) {
                            "second list end %.3f\n",
                            dn, rec / dn, ps2 / dn, ws / dn);
             }
+            if (record_n) printf("Record on the CPU: %.4f ms mean over %d calls\n", record_cpu / record_n, record_n);
             if (enqueue_n) printf("Enqueue on the CPU: %.3f ms mean over %d calls\n", enqueue_cpu / enqueue_n, enqueue_n);
         }
         upload->Unmap(0, nullptr);

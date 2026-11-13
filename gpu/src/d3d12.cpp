@@ -359,9 +359,10 @@ void D3dDevice::staged(const Buffer& b, uint64_t off, uint64_t size, const void*
     if (!cl_) throw std::runtime_error("D3dDevice: recording outside bind()");
     const uint64_t at = (ring_off_ + 255) & ~uint64_t(255);
     if (at + size > ring_end_) throw std::runtime_error("D3dDevice: upload ring slot full");
-    if (is_fill)
-        for (uint64_t i = 0; i < size; i += 4) memcpy(ring_map_ + at + i, &value, size_t(std::min<uint64_t>(4, size - i)));
-    else
+    if (is_fill) {
+        std::fill_n(reinterpret_cast<uint32_t*>(ring_map_ + at), size_t(size / 4), value);
+        memcpy(ring_map_ + at + (size & ~uint64_t(3)), &value, size_t(size & 3));
+    } else
         memcpy(ring_map_ + at, data, size_t(size));
     ring_off_ = at + size;
     auto* r = static_cast<ID3D12Resource*>(b.res);
@@ -520,6 +521,13 @@ Kernel D3dDevice::load(const std::string& spv_path, uint32_t subgroup) {
         patched = patch_elf(elf);
     } catch (const std::exception& x) {
         throw std::runtime_error(std::filesystem::path(spv_path).stem().string() + ": " + x.what());
+    }
+    // the C = 160 levels run fewer windows than there are CUs: WGP mode gives each workgroup all four SIMDs of a WGP, same code
+    // (not on the RX 7000 set: measured there in CU mode)
+    if (std::filesystem::path(spv_path).stem().string().find("160_256") != std::string::npos && spv_path.find("-gfx11") == std::string::npos) {
+        const uint8_t* key = reinterpret_cast<const uint8_t*>("\xa9.wgp_mode");
+        auto it = std::search(patched.begin(), patched.end(), key, key + 10);
+        if (it != patched.end() && it[10] == 0xc2) it[10] = 0xc3;
     }
     AmdElfInfo info;
     info.elf = patched.data();
