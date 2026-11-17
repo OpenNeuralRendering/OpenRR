@@ -306,6 +306,12 @@ int wmain(int argc, wchar_t** argv) {
         auto set_fast = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFastMode"));
         auto get_fast = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFastMode"));
         if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1);
+        // ONR_VALIDATE_FP8=1: FP8 (OnrRrSetFp8) from the start, waited for after the network is ready;
+        // ONR_VALIDATE_FP8_FLIP=n: flipped every n frames (on first), ONR_VALIDATE_FP8_AT=n: asked at frame n and waited for there
+        auto set_f8 = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFp8"));
+        auto get_f8 = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFp8"));
+        const bool f8_start = getenv("ONR_VALIDATE_FP8") && atoi(getenv("ONR_VALIDATE_FP8")) && set_f8;
+        if (f8_start) set_f8(ctx, 1);
         // ONR_VALIDATE_IDLE=1: a second context that never records, so two networks live in the process
         void* idle = nullptr;
         if (getenv("ONR_VALIDATE_IDLE")) {
@@ -997,6 +1003,12 @@ int wmain(int argc, wchar_t** argv) {
             if (std::chrono::steady_clock::now() - t0 > std::chrono::minutes(5)) throw std::runtime_error("network not ready after 5 minutes");
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
+        // with the fast mode asked too, the FP8 kernels are built right after its own, on the builder the first network
+        // frame started: wait here without recording (a repeated frame 0 would shift the engine's frame parity)
+        if (f8_start && get_f8) {
+            while (get_f8(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            printf("fp8 state %d\n", get_f8(ctx));
+        }
         printf("network ready after %.1f s (weights: %s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                info.weights_source);
         // ONR_VALIDATE_FAST=1: the runtime's fast mode (OnrRrSetFastMode) from the start, built with the network;
@@ -1007,11 +1019,15 @@ int wmain(int argc, wchar_t** argv) {
         // ONR_VALIDATE_FAST_LEVEL=2: the level FAST_AT and FAST_FLIP ask for (2 is the experimental one); ONR_VALIDATE_FAST=2 too
         const int fast_level = getenv("ONR_VALIDATE_FAST_LEVEL") ? atoi(getenv("ONR_VALIDATE_FAST_LEVEL"))
                                : getenv("ONR_VALIDATE_FAST") && atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1;
+        const int f8_flip = getenv("ONR_VALIDATE_FP8_FLIP") ? atoi(getenv("ONR_VALIDATE_FP8_FLIP")) : 0;
+        const int f8_at = getenv("ONR_VALIDATE_FP8_AT") ? atoi(getenv("ONR_VALIDATE_FP8_AT")) : -1;
         auto fast_sync = [&](int f) {
             if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? fast_level : 0);
             if (f == fast_at && set_fast) {
                 set_fast(ctx, fast_level);
             }
+            if (f8_flip && set_f8 && f % f8_flip == 0) set_f8(ctx, (f / f8_flip) % 2 == 0 ? 1 : 0);
+            if (f == f8_at && set_f8) set_f8(ctx, 1);
         };
         printf("frame  PSNR dB  equal %%   GPU ms (ingest + network + pack)  output hash\n");
         int bad = 0;
@@ -1023,6 +1039,11 @@ int wmain(int argc, wchar_t** argv) {
             if (f == fast_at && get_fast) {
                 while (get_fast(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 printf("fast mode ready %.2f s after it was asked for (state %d)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - fast_t0).count(), get_fast(ctx));
+            }
+            if (f == f8_at && get_f8) {
+                // the build starts on a frame with the mode built: frames go on until then, so wait for state 2 to end
+                while (get_f8(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                printf("fp8 ready %.2f s after it was asked for (state %d)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - fast_t0).count(), get_f8(ctx));
             }
             api.GetInfo(ctx, &info);
             uint16_t* m = nullptr;
@@ -1083,6 +1104,7 @@ int wmain(int argc, wchar_t** argv) {
             const int ldn = ldc ? atoi(ldc + 1) : 0;
             record_cpu = 0, record_n = 0;
             for (int i = 0, n = atoi(lp); i < n; ++i) {
+                if (fast_flip || f8_flip) fast_sync(nframes + i);   // the flips go on through the loop
                 if (cycle) run_frame(i % nframes);
                 else run_frame(nframes - 1, false);
                 if (ldn && (i + 1) % ldn == 0) {

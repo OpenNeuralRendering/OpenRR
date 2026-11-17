@@ -15,6 +15,7 @@ struct EngineFrame {
     I2 render{}, output{};
     float jitter[2] = {};       // render pixels
     float mv_scale[2] = {1, 1}; // raw motion vector -> render pixels
+    bool mv_jittered = false;   // the motion vectors include (previous - current) jitter (NGX MVJittered)
     float world_to_view[16] = {};
     float view_to_clip[16] = {};
     float depth_sign = 1;       // the depth guide holds view z * depth_sign (linear, positive ahead)
@@ -64,6 +65,7 @@ struct GuideTable {
 struct Enc0BlockInput {
     I2 render, internal, ds;
     float jitter[2], prev_jitter[2], mv_scale[2];
+    float mv_offset[2];     // raw units, added to every motion vector before mv_scale (0x328 / 0x32c)
     const float* w2v;
     const float* v2c;
     const float* prev_w2v;

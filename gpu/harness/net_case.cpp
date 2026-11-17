@@ -856,6 +856,7 @@ int run_optguides(Ctx& c, const fs::path& cases) {
     // one enc0 run: the parameter block with the table t after it, the attribute half's kernel and the stage's (sk empty:
     // the attribute half alone)
     struct Run { std::vector<uint16_t> attr, pmv2, nond; std::vector<uint8_t> tensor; };
+    uint64_t dm_addr = 0;   // the disocclusion mask (r32f) for the next runs
     auto run = [&](const uint64_t* t, const std::string& ak, const std::string& sk, bool wide) {
         std::vector<uint8_t> blk(prm);
         blk.resize(1088 + 64, 0);
@@ -866,6 +867,7 @@ int run_optguides(Ctx& c, const fs::path& cases) {
         auto st = enc0_stages(P, cf, i2, o);
         auto* a = reinterpret_cast<Enc0AttrPC*>(st[0].pc.data());
         if (t) a->hist_off |= 2u;
+        a->disocc = dm_addr;
         if (wide) {   // the 64-byte record: its own buffer (enc0_stages sized the 48-fp16 one)
             const Buffer w = P.zero(size_t(1280) * 736 * 64 + 64);
             a->attr = w.addr;
@@ -966,6 +968,34 @@ int run_optguides(Ctx& c, const fs::path& cases) {
         for (size_t i = 0; i < px * 4; ++i) ds += s.pmv2[i] != h.pmv2[i];
         printf("  fast, SpecularMvec = the motion vectors against no hit distance: %zu values differ (want 0)\n", ds);
         bad += ds != 0;
+        // ONR_OPTG_DUMP=<dir>: TensorOutput without guides and with a depth of field guide alone (0.2 on 64-pixel
+        // checker squares, the RR_Contrast value), for the SASS interpreter (docs/FIDELIDADE-2026-11-14.md)
+        if (const char* dd = getenv("ONR_OPTG_DUMP")) {
+            std::vector<float> g(px);
+            for (size_t i = 0; i < px; ++i) g[i] = (((i % 1280) / 64 + (i / 1280) / 64) & 1) ? 0.2f : 0.0f;
+            const Buffer b_g = P.vec(g);
+            const uint64_t tdof[5] = {z_resp.addr, 0, b_g.addr, 0, 0};
+            const Run g1 = run(tdof, "enc0_attr_f_w", "enc0_stage_32_64_f_w", true);
+            auto put = [&](const char* n, const void* p, size_t sz) {
+                FILE* f = fopen((fs::path(dd) / n).string().c_str(), "wb");
+                if (f) fwrite(p, 1, sz, f), fclose(f);
+            };
+            put("dof.f32", g.data(), g.size() * 4);
+            put("tensor_none.u8", n0.tensor.data(), n0.tensor.size());
+            put("tensor_dof.u8", g1.tensor.data(), g1.tensor.size());
+            // the responsivity mask alone (0.75 on the same squares) and the disocclusion mask alone (1)
+            std::vector<float> rm(px), dm(px);
+            for (size_t i = 0; i < px; ++i) rm[i] = g[i] > 0.0f ? 0.75f : 0.0f, dm[i] = g[i] > 0.0f ? 1.0f : 0.0f;
+            const Buffer b_rm = P.vec(rm), b_dm = P.vec(dm);
+            const uint64_t tresp[5] = {b_rm.addr, 0, z_dof.addr, 0, 0};
+            const Run g2 = run(tresp, "enc0_attr_f_w", "enc0_stage_32_64_f_w", true);
+            put("tensor_resp.u8", g2.tensor.data(), g2.tensor.size());
+            dm_addr = b_dm.addr;
+            const Run g3 = run(nullptr, "enc0_attr_f", "enc0_stage_32_64_f", false);
+            dm_addr = 0;
+            put("tensor_disocc.u8", g3.tensor.data(), g3.tensor.size());
+            printf("  dumped TensorOutput (no guide, depth of field guide) in %s\n", dd);
+        }
     } else {
         printf("  no 64-byte record kernels (enc0_attr_f_w, enc0_stage_32_64_f_w)\n");
         ++bad;

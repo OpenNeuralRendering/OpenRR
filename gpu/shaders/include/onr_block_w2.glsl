@@ -211,9 +211,15 @@ void main() {
 #define XIN_B(pl, a, b) XIN2(x1##a, x1##b, tpb, rb, uint(pl))
 #endif
     W2P(XIN_A) W2P(XIN_B)
+#ifdef LT_F8OUT
+    // e4m3 out projection: fp32 sums over the heads (d<token tile><channel tile>), O_h to e4m3 once per head
+#define DECL_C0(n) ACC c0##n, c1##n; QC8 d0##n = QC8(bias_acc_t(pc.out_b, uint(n) * 16u)), d1##n = d0##n;
+    W2T(DECL_C0)
+#else
 #define DECL_C0(n) ACC c0##n = bias_acc_t(pc.out_b, uint(n) * 16u);
 #define DECL_C1(n) ACC c1##n = c0##n;
     W2T(DECL_C0) W2T(DECL_C1)
+#endif
 #if DEC_UP
     // both subgroups have read U before head 0 overwrites it (a barrier inside the head loop costs the weight prefetch)
     WG_SYNC();
@@ -259,7 +265,12 @@ void main() {
         coopMatStore(q10, lds, W2Q + rb * QST, QST, COL); coopMatStore(q11, lds, W2Q + rb * QST + 16u, QST, COL);
         coopMatStore(v00, lds, W2V + ra, VST, VLAY); coopMatStore(v01, lds, W2V + 16u * VST + ra, VST, VLAY);
         coopMatStore(v10, lds, W2V + rb, VST, VLAY); coopMatStore(v11, lds, W2V + 16u * VST + rb, VST, VLAY);
-#if !W2_DEFER
+#if !W2_DEFER && defined(LT_F8OUT)
+        QA8 wo00, wo01, wo10, wo11, wo20, wo21, wo30, wo31;
+#define WO8(f, off) coopMatLoad(f, E4View(uint64_t(pc.wout)).v, E4T_OUT(off), 16u, ROW);
+        WO8(wo00, hd * 32u) WO8(wo01, hd * 32u + 16u) WO8(wo10, 16u * ENC_X + hd * 32u) WO8(wo11, 16u * ENC_X + hd * 32u + 16u)
+        WO8(wo20, 32u * ENC_X + hd * 32u) WO8(wo21, 32u * ENC_X + hd * 32u + 16u) WO8(wo30, 48u * ENC_X + hd * 32u) WO8(wo31, 48u * ENC_X + hd * 32u + 16u)
+#elif !W2_DEFER
         // out projection fragments of the head: [channel tile][dim tile], K = 32 hd + dims
         MA wo00, wo01, wo10, wo11, wo20, wo21, wo30, wo31;
         WLD(wo00, pc.wout.v, WT_OUT(hd * 32u), WS_OUT, ROW); WLD(wo01, pc.wout.v, WT_OUT(hd * 32u + 16u), WS_OUT, ROW);
@@ -307,7 +318,17 @@ void main() {
               IFK((r0_) >> 4, 1u) { CPB(b_, p1) coopMatLoad(a_, lds, W2V + 16u, VST, ROW); MMA(o0, a_, b_) coopMatLoad(a_, lds, W2V + 16u * VST + 16u, VST, ROW); MMA(o1, a_, b_) } \
               IFK((r0_) >> 4, 2u) { CPB(b_, p2) coopMatLoad(a_, lds, W2V + 32u, VST, ROW); MMA(o0, a_, b_) coopMatLoad(a_, lds, W2V + 16u * VST + 32u, VST, ROW); MMA(o1, a_, b_) } \
               IFK((r0_) >> 4, 3u) { CPB(b_, p3) coopMatLoad(a_, lds, W2V + 48u, VST, ROW); MMA(o0, a_, b_) coopMatLoad(a_, lds, W2V + 16u * VST + 48u, VST, ROW); MMA(o1, a_, b_) } } }
-#if W2_DEFER
+#if W2_DEFER && defined(LT_F8OUT)
+        QC8 oa0 = QC8(0.0), oa1 = QC8(0.0), ob0 = QC8(0.0), ob1 = QC8(0.0);
+        ATT(ra, q00, q01, oa0, oa1)
+        ATT(rb, q10, q11, ob0, ob1)
+        {
+            QB8 ba0, ba1, bb0, bb1;
+            Q8B(ba0, oa0) Q8B(ba1, oa1) Q8B(bb0, ob0) Q8B(bb1, ob1)
+#define OUTP8(n) { QA8 wo_; coopMatLoad(wo_, E4View(uint64_t(pc.wout)).v, E4T_OUT(uint(n) * 16u * ENC_X + hd * 32u), 16u, ROW); MMA(d0##n, wo_, ba0) MMA(d1##n, wo_, bb0)             coopMatLoad(wo_, E4View(uint64_t(pc.wout)).v, E4T_OUT(uint(n) * 16u * ENC_X + hd * 32u + 16u), 16u, ROW); MMA(d0##n, wo_, ba1) MMA(d1##n, wo_, bb1) }
+            W2T(OUTP8)
+        }
+#elif W2_DEFER
         // both token tiles first, then the out projection with each fragment serving both
         ACC oa0 = ACC(0.0), oa1 = ACC(0.0), ob0 = ACC(0.0), ob1 = ACC(0.0);
         ATT(ra, q00, q01, oa0, oa1)
@@ -336,10 +357,20 @@ void main() {
 #define OUT4(o0, o1, ca0, ca1, ca2, ca3) { MB b_; \
             MH oh = MH(o0); CPB(b_, oh) MMA(ca0, wo00, b_) MMA(ca1, wo10, b_) MMA(ca2, wo20, b_) MMA(ca3, wo30, b_) \
             oh = MH(o1); CPB(b_, oh) MMA(ca0, wo01, b_) MMA(ca1, wo11, b_) MMA(ca2, wo21, b_) MMA(ca3, wo31, b_) }
+#ifdef LT_F8OUT
+#define OUT48(o0, o1, ca0, ca1, ca2, ca3) { QB8 b_;             Q8B(b_, o0) MMA(ca0, wo00, b_) MMA(ca1, wo10, b_) MMA(ca2, wo20, b_) MMA(ca3, wo30, b_)             Q8B(b_, o1) MMA(ca0, wo01, b_) MMA(ca1, wo11, b_) MMA(ca2, wo21, b_) MMA(ca3, wo31, b_) }
+        { QC8 o0 = QC8(0.0), o1 = QC8(0.0); ATT(ra, q00, q01, o0, o1) OUT48(o0, o1, d00, d01, d02, d03) }
+        { QC8 o0 = QC8(0.0), o1 = QC8(0.0); ATT(rb, q10, q11, o0, o1) OUT48(o0, o1, d10, d11, d12, d13) }
+#else
         { ACC o0 = ACC(0.0), o1 = ACC(0.0); ATT(ra, q00, q01, o0, o1) OUT4(o0, o1, c00, c01, c02, c03) }
         { ACC o0 = ACC(0.0), o1 = ACC(0.0); ATT(rb, q10, q11, o0, o1) OUT4(o0, o1, c10, c11, c12, c13) }
 #endif
+#endif
     }
+#ifdef LT_F8OUT
+#define OUT_E8(n) c0##n = ACC(d0##n); c1##n = ACC(d1##n);
+    W2T(OUT_E8)
+#endif
     // x1 = fma(O out^T + b, ls1, x)
 #define RESID1(cn, xn, l) { RES_IN(a16, cn) for (int i = 0; i < a16.length(); i += 2) { \
         precise f16vec2 v = fma(f16vec2(a16[i], a16[i + 1]), f16vec2(l), f16vec2(xn[i], xn[i + 1])); xn[i] = v.x, xn[i + 1] = v.y; } }
@@ -348,6 +379,56 @@ void main() {
 #define RES_A2(n) RESID1(c0##n, x0##n, ls2)
 #define RES_B2(n) RESID1(c1##n, x1##n, ls2)
     W2T(RES_A1) W2T(RES_B1)
+#ifdef LT_F8MLP
+    // e4m3 MLP (onr_block_fast.glsl): x1 as e4m3 once, fc1 / fc2 on the e4m3 weight tiles, fp32 sums, the hidden layer to
+    // e4m3 after its GELU; each weight fragment serves both token tiles
+#ifndef W2_SL8
+#define W2_SL8 W2_SL
+#endif
+#define X1Q2(n) QB8 z0##n, z1##n; Q8BS(z0##n, x0##n, F8XINV) Q8BS(z1##n, x1##n, F8XINV)
+    W2T(X1Q2)
+#define FC2B8(n) QC8 m0##n = QC8(bias_acc_t(pc.fc2_b, uint(n) * 16u)) F8INV; QC8 m1##n = m0##n;
+    W2T(FC2B8)
+#define FC2_18(n, m, ba, bb) { QA8 g_; coopMatLoad(g_, E4View(uint64_t(pc.fc2)).v, E4T_FC2(uint(n) * 16u * HID + j + (m) * 16u), 16u, ROW); \
+            MMA(m0##n, g_, ba) MMA(m1##n, g_, bb) }
+#if NT > 4
+#define FC2_458(m, ba, bb) FC2_18(4, m, ba, bb) FC2_18(5, m, ba, bb)
+#else
+#define FC2_458(m, ba, bb)
+#endif
+#define FC2_N8(m, ha, hb) { QB8 ba_, bb_; G8B(ba_, ha) G8B(bb_, hb) \
+            FC2_18(0, m, ba_, bb_) FC2_18(1, m, ba_, bb_) FC2_18(2, m, ba_, bb_) FC2_18(3, m, ba_, bb_) FC2_458(m, ba_, bb_) }
+#define FC1_W8(f, jj, n) coopMatLoad(f, E4View(uint64_t(pc.fc1)).v, E4T_FC1((jj) * ENC_C + (n) * 16u), 16u, ROW);
+#if W2_SL8 == 64
+    for (uint j = 0u; j < LT_HID; j += 64u) {
+        QC8 hb0 = QC8(bias_acc_t(pc.fc1_b, j)) F8XINV, hb1 = QC8(bias_acc_t(pc.fc1_b, j + 16u)) F8XINV, hb2 = QC8(bias_acc_t(pc.fc1_b, j + 32u)) F8XINV, hb3 = QC8(bias_acc_t(pc.fc1_b, j + 48u)) F8XINV;
+        QC8 h00 = hb0, h01 = hb1, h02 = hb2, h03 = hb3, h10 = hb0, h11 = hb1, h12 = hb2, h13 = hb3;
+#define FC1_K8(n) { QA8 f0, f1, f2, f3; FC1_W8(f0, j, uint(n)) FC1_W8(f1, j + 16u, uint(n)) FC1_W8(f2, j + 32u, uint(n)) FC1_W8(f3, j + 48u, uint(n)) \
+            MMA(h00, f0, z0##n) MMA(h01, f1, z0##n) MMA(h02, f2, z0##n) MMA(h03, f3, z0##n) \
+            MMA(h10, f0, z1##n) MMA(h11, f1, z1##n) MMA(h12, f2, z1##n) MMA(h13, f3, z1##n) }
+        W2T(FC1_K8)
+        FC2_N8(0u, h00, h10) FC2_N8(1u, h01, h11) FC2_N8(2u, h02, h12) FC2_N8(3u, h03, h13)
+    }
+#elif W2_SL8 == 32
+    for (uint j = 0u; j < LT_HID; j += 32u) {
+        QC8 hb0 = QC8(bias_acc_t(pc.fc1_b, j)) F8XINV, hb1 = QC8(bias_acc_t(pc.fc1_b, j + 16u)) F8XINV;
+        QC8 h00 = hb0, h01 = hb1, h10 = hb0, h11 = hb1;
+#define FC1_K82(n) { QA8 f0, f1; FC1_W8(f0, j, uint(n)) FC1_W8(f1, j + 16u, uint(n)) \
+            MMA(h00, f0, z0##n) MMA(h01, f1, z0##n) MMA(h10, f0, z1##n) MMA(h11, f1, z1##n) }
+        W2T(FC1_K82)
+        FC2_N8(0u, h00, h10) FC2_N8(1u, h01, h11)
+    }
+#else
+    for (uint j = 0u; j < LT_HID; j += 16u) {
+        QC8 h00 = QC8(bias_acc_t(pc.fc1_b, j)) F8XINV, h10 = h00;
+#define FC1_K81(n) { QA8 f0; FC1_W8(f0, j, uint(n)) MMA(h00, f0, z0##n) MMA(h10, f0, z1##n) }
+        W2T(FC1_K81)
+        FC2_N8(0u, h00, h10)
+    }
+#endif
+#define FC2E(n) c0##n = ACC(m0##n F8MUL); c1##n = ACC(m1##n F8MUL);
+    W2T(FC2E)
+#else
 #define FC2B0(n) c0##n = bias_acc_t(pc.fc2_b, uint(n) * 16u);
 #define FC2B1(n) c1##n = c0##n;
     W2T(FC2B0) W2T(FC2B1)
@@ -389,6 +470,7 @@ void main() {
         GELU1(h00) GELU1(h01) GELU1(h10) GELU1(h11)
         FC2_N(0u, h00, h10) FC2_N(1u, h01, h11)
     }
+#endif
 #endif
     W2T(RES_A2) W2T(RES_B2)
     // TensorOutput of the own tokens straight from the x^T tiles, one 16-byte store per lane and plane

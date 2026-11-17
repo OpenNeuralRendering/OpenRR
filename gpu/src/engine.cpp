@@ -113,7 +113,7 @@ std::array<uint32_t, 272> enc0_block(const Enc0BlockInput& in) {
     F(0x310, 1.0f / ix), F(0x314, 1.0f / iy);
     F(0x318, in.prev_jitter[0] / rx), F(0x31c, in.prev_jitter[1] / ry);
     F(0x320, in.mv_scale[0] * (ix / rx)), F(0x324, in.mv_scale[1] * (iy / ry));
-    F(0x328, 0), F(0x32c, 0);
+    F(0x328, in.mv_offset[0]), F(0x32c, in.mv_offset[1]);
     I(0x350, in.ds.x), I(0x354, in.ds.y);
     F(0x358, 1.0f / ix), F(0x35c, 1.0f / iy);
     F(0x360, 1.0f / float(in.ds.x)), F(0x364, 1.0f / float(in.ds.y));
@@ -126,6 +126,15 @@ std::array<uint32_t, 272> enc0_block(const Enc0BlockInput& in) {
     to_d(in.w2v, w2v), to_d(in.v2c, v2c), to_d(in.prev_w2v, pw2v), to_d(in.prev_v2c, pv2c);
     if (!invert(w2v, iw2v)) memset(iw2v, 0, sizeof iw2v), iw2v[0] = iw2v[5] = iw2v[10] = iw2v[15] = 1;
     if (!invert(v2c, iv2c)) memset(iv2c, 0, sizeof iv2c), iv2c[0] = iv2c[5] = iv2c[10] = iv2c[15] = 1;
+    // world positions relative to the current camera: the same reflection vectors, but the shader's fp32 math no longer
+    // works on game world coordinates (thousands of units in an open world), where pixel -> world -> previous pixel
+    // lost whole pixels with a still camera and reflections crept across the screen (docs/DRIFT-MVJITTERED.md)
+    if (iw2v[12] != 0 || iw2v[13] != 0 || iw2v[14] != 0) {
+        double t[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, iw2v[12], iw2v[13], iw2v[14], 1};
+        mul(t, pw2v, pw2v);
+        t[12] = -t[12], t[13] = -t[13], t[14] = -t[14];
+        mul(iw2v, t, iw2v);
+    }
     // camera position (world), the current projection, pixel -> world and world -> previous pixel
     F(0x3d8, float(iw2v[12])), F(0x3dc, float(iw2v[13])), F(0x3e0, float(iw2v[14]));
     // the projection as the depth guide reads it (row 2 takes view z)
@@ -272,11 +281,18 @@ void Engine::upload_stage(const StageWeights& s, StageBufs& b) {
     };
     UQ(b.in_a, s.b.in_a, s.b.C == 32 ? lr_keys(s.b.in_a, s.b.C, s.b.X) : H16{});
     UQ(b.in_b, s.b.in_b, s.b.C == 32 ? vo_values(s.b.in_b, s.b.out, s.b.C, s.b.X) : H16{});
-    U(b.out, with_tiles(s.b.out, s.b.X));
+    // out, fc1, fc2: the fp16 values, their 16x16 tile copy, then the OCP e4m3 codes of both (the New mode's FP8 products,
+    // LT_F8*, read the tiles' codes at 5 n bytes; the other kernels never read past 4 n)
+    auto UT = [&](Buffer& dst, const H16& v, int K) {
+        if (v.empty()) { dst = {}; return; }
+        auto d = qv_bytes(with_tiles(v, size_t(K)).data(), v.size() * 2);
+        pack_bytes(dev_, fixed_, d.data(), d.size(), &dst);
+    };
+    UT(b.out, s.b.out, s.b.X);
     U(b.out_b, s.b.out_b);
-    U(b.fc1, with_tiles(s.b.fc1, s.b.C));
+    UT(b.fc1, s.b.fc1, s.b.C);
     U(b.fc1_b, s.b.fc1_b);
-    U(b.fc2, with_tiles(s.b.fc2, 4 * s.b.C));
+    UT(b.fc2, s.b.fc2, 4 * s.b.C);
     U(b.fc2_b, s.b.fc2_b);
     U(b.bias, s.b.bias);
     U(b.dfn_w, s.dfn_w);
@@ -551,8 +567,13 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
     const float* pw2v = zero_matrix(prev_w2v_) ? ident : prev_w2v_;
     const float* v2c = zero_matrix(f.view_to_clip) ? persp : f.view_to_clip;
     const float* pv2c = zero_matrix(prev_v2c_) ? persp : prev_v2c_;
+    // MVJittered: NGX adds (current - previous) jitter to the motion vectors (and to GBuffer.SpecularMvec, read with the
+    // same offset); render pixels, so divided by mv_scale for the raw units the offset is added in
+    float mvo[2] = {0, 0};
+    for (int i = 0; i < 2 && f.mv_jittered; ++i)
+        if (f.mv_scale[i] != 0) mvo[i] = (f.jitter[i] - prev_jitter_[i]) / f.mv_scale[i];
     Enc0BlockInput bi{f.render, internal_, ds_, {f.jitter[0], f.jitter[1]}, {prev_jitter_[0], prev_jitter_[1]},
-                      {f.mv_scale[0], f.mv_scale[1]}, w2v, v2c, pw2v, pv2c, W.enc0_scalars, f.depth_sign};
+                      {f.mv_scale[0], f.mv_scale[1]}, {mvo[0], mvo[1]}, w2v, v2c, pw2v, pv2c, W.enc0_scalars, f.depth_sign};
     auto blk = enc0_block(bi);
     if (fresh_) d.fill(expo_[old], 0, 4, 0);
     d.update(prm_, 0, kBlockBytes, blk.data());

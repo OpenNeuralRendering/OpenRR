@@ -5,7 +5,7 @@ cards (RDNA4), with kernels written from scratch. It is the Ray Reconstruction r
 inside the [OpenNR OptiScaler fork](https://github.com/MatheusFerreiraS/OpenNR-OptiScaler): when a game asks for DLSS
 Ray Reconstruction, OptiScaler hands the frame to OpenRR.
 
-Version 0.1.6. MIT licence.
+Version 0.1.7. MIT licence.
 
 Discord: <https://discord.gg/wYhvS3JSHM>
 
@@ -48,6 +48,11 @@ Three modes, picked in the menu or with `Mode` in `[OpenNR-RR]` (`new`, `fast`, 
 Measured on an RX 9070 XT, outside a game. The first start builds the kernels of New and Fast in the background, with the
 image on Legacy until they're ready. Fast changes more from frame to frame in motion and on very bright points: look at
 those before keeping it.
+
+**FP8 (experimental)**, off by default: a box under the mode in the menu, or `Fp8` in `[OpenNR-RR]`. It runs part of
+the New and Fast networks in FP8 on RX 9000 (about 1-2% less GPU time) and flips live; the first time it builds its
+kernels in the background. Very bright points (sparks, small lights) may look a little different. Legacy ignores it,
+and RX 7000 cards don't have it.
 
 Tested in Cyberpunk 2077, Resident Evil Requiem, Hogwarts Legacy and Neverness to Everness (D3D12), and Indiana Jones
 and the Great Circle (Vulkan). DOOM: The Dark Ages is not supported: its menu hides DLSS on AMD GPUs.

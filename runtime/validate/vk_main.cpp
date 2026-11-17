@@ -371,6 +371,13 @@ int wmain(int argc, wchar_t** argv) {
         const int fast_level = getenv("ONR_VALIDATE_FAST_LEVEL") ? atoi(getenv("ONR_VALIDATE_FAST_LEVEL"))
                                : getenv("ONR_VALIDATE_FAST") && atoi(getenv("ONR_VALIDATE_FAST")) == 2 ? 2 : 1;
         if (getenv("ONR_VALIDATE_FAST") && set_fast) set_fast(ctx, fast_level);
+        // ONR_VALIDATE_FP8=1 / _FP8_FLIP=n / _FP8_AT=n: FP8 (OnrRrSetFp8) as in the D3D12 validator
+        auto set_f8 = reinterpret_cast<int32_t (*)(void*, int32_t)>(GetProcAddress(dll, "OnrRrSetFp8"));
+        auto get_f8 = reinterpret_cast<int32_t (*)(void*)>(GetProcAddress(dll, "OnrRrGetFp8"));
+        const bool f8_start = getenv("ONR_VALIDATE_FP8") && atoi(getenv("ONR_VALIDATE_FP8")) && set_f8;
+        const int f8_flip = getenv("ONR_VALIDATE_FP8_FLIP") ? atoi(getenv("ONR_VALIDATE_FP8_FLIP")) : 0;
+        const int f8_at = getenv("ONR_VALIDATE_FP8_AT") ? atoi(getenv("ONR_VALIDATE_FP8_AT")) : -1;
+        if (f8_start) set_f8(ctx, 1);
         printf("render %ux%u -> %ux%u, %d frames, _f, backend %s, guides %s, depth %s\n", RW, RH, OW, OH, nframes,
                backend == ONR_RR_BACKEND_VULKAN_HOST ? "Vulkan host" : "other", general ? "GENERAL" : "SHADER_READ_ONLY_OPTIMAL",
                depth_kind == 2 ? "D32_SFLOAT_S8_UINT" : depth_kind ? "D32_SFLOAT" : "R32_SFLOAT");
@@ -569,6 +576,12 @@ int wmain(int argc, wchar_t** argv) {
             if (std::chrono::steady_clock::now() - t0 > std::chrono::minutes(5)) throw std::runtime_error("network not ready after 5 minutes");
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
+        // with the fast mode asked too, the FP8 kernels are built right after its own, on the builder the first network
+        // frame started: wait here without recording (a repeated frame 0 would shift the engine's frame parity)
+        if (f8_start && get_f8) {
+            while (get_f8(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            printf("fp8 state %d\n", get_f8(ctx));
+        }
         printf("network ready after %.1f s (weights: %s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                info.weights_source);
         if (second) {
@@ -582,7 +595,15 @@ int wmain(int argc, wchar_t** argv) {
         for (int f = 0; f < nframes; ++f) {
             if (fast_flip && set_fast && f % fast_flip == 0) set_fast(ctx, (f / fast_flip) % 2 == 0 ? fast_level : 0);
             if (f == fast_at && set_fast) set_fast(ctx, fast_level);
+            if (f8_flip && set_f8 && f % f8_flip == 0) set_f8(ctx, (f / f8_flip) % 2 == 0 ? 1 : 0);
+            if (f == f8_at && set_f8) set_f8(ctx, 1);
             if (f) run_frame(f, true);
+            if (f == f8_at && get_f8) {
+                const auto w0 = std::chrono::steady_clock::now();
+                while (get_f8(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                printf("fp8 ready %.2f s after it was asked for (state %d)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(),
+                       get_f8(ctx));
+            }
             if (f == fast_at && get_fast) {
                 const auto w0 = std::chrono::steady_clock::now();
                 while (get_fast(ctx) == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));

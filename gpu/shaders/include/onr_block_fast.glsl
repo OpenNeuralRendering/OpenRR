@@ -298,7 +298,7 @@ ACC bias_acc_t(F16Buf b, uint n0) {
 // LT_UP8 (decoder _0, W1 and W2) and LT_MI8 (enc1): the up and the input merge products on e4m3 x e4m3 -> fp32 as well. Their B
 // operands are the e4m3 bytes of the planes they read and their weights are exact e4m3 (Engine::upload_stage keeps the codes
 // after the fp16 values); one rounding to fp16 per output instead of one per 16 K
-#if FP8QV || defined(LT_UP8) || defined(LT_MI8)
+#if FP8QV || defined(LT_UP8) || defined(LT_MI8) || defined(LT_F8MLP) || defined(LT_F8OUT)
 #extension GL_EXT_float_e4m3 : require
 #define QA8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define QB8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
@@ -323,6 +323,67 @@ uint ocp4(uint w) {
 #define OCP4(w) ocp4(w)
 #endif
 #define W8STEP(acc, addr, off, b) { QA8 a_; coopMatLoad(a_, E4View(addr).v, off, ENC_C, ROW); acc = coopMatMulAdd(a_, b, acc); }
+#endif
+
+#if defined(LT_F8MLP) || defined(LT_F8OUT)
+#if FRAG_ROWS || !WTILE
+#error "LT_F8MLP / LT_F8OUT: RDNA4 fragments and the tiled weights only"
+#endif
+#if defined(LT_F8OUT) && SPLIT == 2
+#error "LT_F8OUT: not in the two-subgroup row tiles (C = 160)"
+#endif
+// LT_F8MLP / LT_F8OUT (New mode, transposed and W2 bodies): the MLP / the out projection on e4m3 x e4m3 -> fp32. The weights
+// are the e4m3 codes of their 16x16 tile copy (byte 5 n + t of the buffer, t the element of the tile copy, n the fp16 values);
+// each activation goes to e4m3 once, where it is produced, straight from fp32 four values at a time
+#define E4T_FC1(off) (WT_FC1(off) + 4u * HID * ENC_C)
+#define E4T_FC2(off) (WT_FC2(off) + 4u * ENC_C * HID)
+#define E4T_OUT(off) (WT_OUT(off) + 4u * ENC_C * ENC_X)
+#define W8T(acc, buf, idx, b) { QA8 a_; coopMatLoad(a_, E4View(uint64_t(buf)).v, idx, 16u, ROW); acc = coopMatMulAdd(a_, b, acc); }
+// LT_F8S: the hidden layer goes to e4m3 divided by this power of two, the fc2 sum (its bias too) is scaled back once
+#ifdef LT_F8S
+#define F8INV * float(1.0 / (LT_F8S))
+#define F8MUL * float(LT_F8S)
+#else
+#define F8INV
+#define F8MUL
+#endif
+// LT_F8SX: the same for x1 (fc1's input); the fc1 sum is scaled back before the GELU
+#ifdef LT_F8SX
+#define F8XINV * float(1.0 / (LT_F8SX))
+#define F8XMUL * float(LT_F8SX)
+#else
+#define F8XINV
+#define F8XMUL
+#endif
+// fp32 -> four e4m3 with saturation (the form of DLSSNR-AMD's coopmm.glsl, MIT): adding x * 0 keeps a NaN past the clamp
+fe4m3vec4 f8q4(vec4 x) { return fe4m3vec4(clamp(x, vec4(-448.0), vec4(448.0)) + x * 0.0); }
+// four e4m3 into elements i .. i + 3 of a fragment; LT_F8PK: through a packed u32 (the fragment rebuilt from its bytes)
+#ifdef LT_F8PK
+#define PUT4(b, i, q) { u8vec4 p_ = unpack8(pack32(floate4m3BitsToUintEXT(q))); \
+        b[i] = uintBitsToFloate4m3EXT(p_.x), b[(i) + 1] = uintBitsToFloate4m3EXT(p_.y), b[(i) + 2] = uintBitsToFloate4m3EXT(p_.z), b[(i) + 3] = uintBitsToFloate4m3EXT(p_.w); }
+#else
+#define PUT4(b, i, q) { fe4m3vec4 r_ = q; b[i] = r_.x, b[(i) + 1] = r_.y, b[(i) + 2] = r_.z, b[(i) + 3] = r_.w; }
+#endif
+// an accumulator (fp32 or fp16) -> the e4m3 B operand of the same matrix (RDNA4: element by element)
+#define Q8B(b, c) Q8BS(b, c, )
+#define Q8BS(b, c, sc) { [[unroll]] for (int i_ = 0; i_ < 8; i_ += 4) PUT4(b, i_, f8q4(vec4(c[i_], c[i_ + 1], c[i_ + 2], c[i_ + 3]) sc)) }
+// gelu2_ in fp32
+#ifdef LT_F8G16
+f16vec2 gelu2(f16vec2 x);
+#endif
+vec4 gelu4(vec4 x) {
+#ifdef LT_F8G16
+    // measurements: the fp16 GELU of the regular path, on the sum rounded to fp16
+    f16vec2 a_ = gelu2(f16vec2(x.xy)), b_ = gelu2(f16vec2(x.zw));
+    return vec4(a_, b_);
+#endif
+    vec4 m = min(abs(x), vec4(2.0));
+    vec4 u = fma(-m, vec4(0.08108), vec4(float(GELU_A)));
+    vec4 g = min(max(fma(x, u, vec4(0.5)), vec4(0.0)), vec4(1.0));
+    return x * g;
+}
+// fp32 hidden accumulator -> GELU -> e4m3 B operand
+#define G8B(b, h) { [[unroll]] for (int i_ = 0; i_ < 8; i_ += 4) PUT4(b, i_, f8q4(gelu4(vec4(h[i_], h[i_ + 1], h[i_ + 2], h[i_ + 3]) F8XMUL) F8INV)) }
 #endif
 
 // GPU fragment position of arena channel a (inverse of arena_channel within a plane)
@@ -453,7 +514,28 @@ f16vec2 gelu_pw2(f16vec2 x) {
 }
 #endif
 
+// LT_FQ (measurements only): values rounded to e4m3 (RN, saturating at 448) where an FP8 product would take them;
+// bit 0: every GELU output (the MLP hidden layer, and the embed's in W1)
+#ifdef LT_FQ
+#extension GL_EXT_float_e4m3 : require
+#ifndef LT_FQS
+#define LT_FQS 1.0
+#endif
+// LT_FQS: a power-of-two scale taken out before the rounding and put back after (exact)
+f16vec2 fq2(f16vec2 x) {
+    vec2 c = clamp(vec2(x) * (1.0 / LT_FQS), vec2(-448.0), vec2(448.0));
+    return f16vec2(vec2(fe4m3vec2(c)) * LT_FQS);
+}
+#endif
+f16vec2 gelu2_(f16vec2 x);
 f16vec2 gelu2(f16vec2 x) {
+#if defined(LT_FQ) && (LT_FQ & 1)
+    return fq2(gelu2_(x));
+#else
+    return gelu2_(x);
+#endif
+}
+f16vec2 gelu2_(f16vec2 x) {
 #ifdef LT_RELU
     return max(x, f16vec2(0.0hf));   // measurements: the activation's ceiling
 #endif
@@ -749,7 +831,12 @@ void main() {
 #define DECL_OUT_T(cn, i) ACC cn = bias_acc_t(pc.out_b, TO(i) * 16u);
     FOR_NO(DECL_OUT_T)
 #else
+#ifdef LT_F8OUT
+    // e4m3 out projection: fp32 sums over the heads, O_h to e4m3 once per head
+#define DECL_OUT_T(cn, xn, n) ACC cn; QC8 cn##_o8 = QC8(bias_acc_t(pc.out_b, (n) * 16u));
+#else
 #define DECL_OUT_T(cn, xn, n) ACC cn = bias_acc_t(pc.out_b, (n) * 16u);
+#endif
     FOR_NX(DECL_OUT_T)
 #endif
     HD_UNROLL for (uint hd = 0u; hd < LT_HEADS; ++hd) {
@@ -872,12 +959,27 @@ void main() {
         }
 #endif
         // O_h^T [32 dims][16 rows] = V_h^T P^T, K = keys
+#if defined(LT_F8OUT) && SPLIT == 1
+        QC8 o0 = QC8(0.0), o1 = QC8(0.0);
+#else
         ACC o0 = ACC(0.0), o1 = ACC(0.0);
+#endif
 #define PV_T(p, kt) { MBP blo, bhi; BPREP(blo, bhi, p) MA a_; \
             coopMatLoad(a_, lds, vb + (kt) * 16u, VST, ROW); TSTEP(o0, a_, blo, bhi) \
             coopMatLoad(a_, lds, vb + 16u * VST + (kt) * 16u, VST, ROW); TSTEP(o1, a_, blo, bhi) }
         IFK(rt, 0u) PV_T(p0, 0u) IFK(rt, 1u) PV_T(p1, 1u) IFK(rt, 2u) PV_T(p2, 2u) IFK(rt, 3u) PV_T(p3, 3u)
         // out projection, K = 32 hd + dims
+#if defined(LT_F8OUT) && SPLIT == 1
+        {
+            QB8 ob;
+            Q8B(ob, o0)
+#define OUT_T08(cn, xn, n) W8T(cn##_o8, pc.wout, E4T_OUT((n) * 16u * ENC_X + hd * 32u), ob)
+            FOR_NX(OUT_T08)
+            Q8B(ob, o1)
+#define OUT_T18(cn, xn, n) W8T(cn##_o8, pc.wout, E4T_OUT((n) * 16u * ENC_X + hd * 32u + 16u), ob)
+            FOR_NX(OUT_T18)
+        }
+#else
         {
             MBP blo, bhi;
             MH oh = MH(o0);
@@ -898,7 +1000,12 @@ void main() {
             FOR_NX(OUT_T1)
 #endif
         }
+#endif
     }
+#if defined(LT_F8OUT) && SPLIT == 1
+#define OUT_E8(cn, xn, n) cn = ACC(cn##_o8);
+    FOR_NX(OUT_E8)
+#endif
     CUT(3)
     // x1 = fma(O out^T + b, ls1, x)
 #define RESID_T(cn, xn, l) { RES_IN(a16, cn) for (int i = 0; i < a16.length(); i += 2) { \
@@ -911,6 +1018,40 @@ void main() {
 #define X1_X(cn, xn, n) RESID_X(cn, xn, n, ls1)
     FOR_NX(X1_X)
     CUT(4)
+#ifdef LT_F8MLP
+    // e4m3 MLP: x1 as e4m3 once; each half's GELU tile goes to e4m3 and through the LDS as the lane's 8 bytes (an
+    // accumulator and a B operand hold the same elements per lane)
+#define X1Q_T(cn, xn, n) QB8 xn##_8; Q8BS(xn##_8, xn, F8XINV)
+    FOR_NX(X1Q_T)
+#define FC2B8_S(cn, i) QC8 cn##_8 = QC8(bias_acc_t(pc.fc2_b, TO(i) * 16u)) F8INV;
+    FOR_NO(FC2B8_S)
+    for (uint j = 0u; j < LT_HID; j += 32u) {
+        uint jt = j + 16u * hf;
+        QC8 h0 = QC8(bias_acc_t(pc.fc1_b, jt)) F8XINV;
+#define FC1_S8(cn, xn, n) W8T(h0, pc.fc1, E4T_FC1(jt * ENC_C + (n) * 16u), xn##_8)
+        FOR_NX(FC1_S8)
+        uint hb = (QV + ((j >> 5) & 1u) * 2048u + rt * 512u) >> 2;
+        {
+            uvec2 u_;
+            [[unroll]] for (int i_ = 0; i_ < 2; ++i_)
+                u_[i_] = pack32(floate4m3BitsToUintEXT(f8q4(gelu4(vec4(h0[4 * i_], h0[4 * i_ + 1], h0[4 * i_ + 2], h0[4 * i_ + 3]) F8XMUL) F8INV)));
+            lds2[hb + hf * 32u + ln] = u_;
+        }
+        WG_SYNC();
+        QB8 b0, b1;
+        {
+            uvec2 u0 = lds2[hb + ln], u1 = lds2[hb + 32u + ln];
+            [[unroll]] for (int i_ = 0; i_ < 2; ++i_) {
+                u8vec4 p_ = unpack8(u0[i_]), q_ = unpack8(u1[i_]);
+                [[unroll]] for (int k_ = 0; k_ < 4; ++k_) b0[4 * i_ + k_] = uintBitsToFloate4m3EXT(p_[k_]), b1[4 * i_ + k_] = uintBitsToFloate4m3EXT(q_[k_]);
+            }
+        }
+#define FC2_S8(cn, i) W8T(cn##_8, pc.fc2, E4T_FC2(TO(i) * 16u * HID + j), b0) W8T(cn##_8, pc.fc2, E4T_FC2(TO(i) * 16u * HID + j + 16u), b1)
+        FOR_NO(FC2_S8)
+    }
+#define FC2E_S(cn, i) cn = ACC(cn##_8 F8MUL);
+    FOR_NO(FC2E_S)
+#else
 #define FC2B_T(cn, i) cn = bias_acc_t(pc.fc2_b, TO(i) * 16u);
     FOR_NO(FC2B_T)
     // 32-neuron slices: half hf computes hidden tile j + 16 hf, the two GELU tiles meet in a double buffer over
@@ -935,6 +1076,7 @@ void main() {
 #define FC2_T2(cn, i) WSTEP(cn, pc.fc2.v, WT_FC2(TO(i) * 16u * HID + j), WS_FC2, b0l, b0h) WSTEP(cn, pc.fc2.v, WT_FC2(TO(i) * 16u * HID + j + 16u), WS_FC2, b1l, b1h)
         FOR_NO(FC2_T2)
     }
+#endif
     FOR_NO(EX_ST)
     WG_SYNC();
 #define X2_X(cn, xn, n) RESID_X(cn, xn, n, ls2)
@@ -943,13 +1085,63 @@ void main() {
 #define X1_T(cn, xn, n) RESID_T(cn, xn, ls1)
     FOR_NX(X1_T)
     CUT(4)
-#define FC2B_T(cn, xn, n) cn = bias_acc_t(pc.fc2_b, (n) * 16u);
-    FOR_NX(FC2B_T)
 #if MLP64
 #define SLICE 64u
 #else
 #define SLICE 32u
 #endif
+#ifdef LT_F8MLP
+    // x1 as e4m3 once, fc1 / fc2 on e4m3 weights, fp32 sums
+// LT_F8FC (measurements): bit 0 fc1 on e4m3, bit 1 fc2 on e4m3 (the other on fp16 operands, fp32 sums)
+#ifndef LT_F8FC
+#define LT_F8FC 3
+#endif
+#if LT_F8FC & 1
+#define X1Q_T(cn, xn, n) QB8 xn##_8; Q8BS(xn##_8, xn, F8XINV)
+#define F1W(acc, off, xn) W8T(acc, pc.fc1, E4T_FC1(off), xn##_8)
+#else
+#define X1Q_T(cn, xn, n)
+#define F1W(acc, off, xn) { MB b_; CPB(b_, xn) MA a_; coopMatLoad(a_, pc.fc1.v, WT_FC1(off), 16u, ROW); acc = coopMatMulAdd(a_, b_, acc); }
+#endif
+#if LT_F8FC & 2
+#define F2B QB8
+#define F2W(acc, off, g) W8T(acc, pc.fc2, E4T_FC2(off), g)
+#else
+#define F2B MB
+#undef G8B
+#define G8B(b, h) { [[unroll]] for (int i_ = 0; i_ < 8; i_ += 4) { vec4 r_ = gelu4(vec4(h[i_], h[i_ + 1], h[i_ + 2], h[i_ + 3]) F8XMUL) F8INV;         b[i_] = float16_t(r_.x), b[i_ + 1] = float16_t(r_.y), b[i_ + 2] = float16_t(r_.z), b[i_ + 3] = float16_t(r_.w); } }
+#define F2W(acc, off, g) { MA a_; coopMatLoad(a_, pc.fc2.v, WT_FC2(off), 16u, ROW); acc = coopMatMulAdd(a_, g, acc); }
+#endif
+    FOR_NX(X1Q_T)
+#define FC2B8_T(cn, xn, n) QC8 cn##_8 = QC8(bias_acc_t(pc.fc2_b, (n) * 16u)) F8INV;
+    FOR_NX(FC2B8_T)
+    J_UNROLL for (uint j = 0u; j < LT_HID; j += SLICE) {
+        QC8 h0 = QC8(bias_acc_t(pc.fc1_b, j)) F8XINV, h1 = QC8(bias_acc_t(pc.fc1_b, j + 16u)) F8XINV;
+#if MLP64
+        QC8 h2 = QC8(bias_acc_t(pc.fc1_b, j + 32u)) F8XINV, h3 = QC8(bias_acc_t(pc.fc1_b, j + 48u)) F8XINV;
+#define FC1_T8(cn, xn, n) F1W(h0, (j * ENC_C + (n) * 16u), xn) F1W(h1, ((j + 16u) * ENC_C + (n) * 16u), xn) \
+            F1W(h2, ((j + 32u) * ENC_C + (n) * 16u), xn) F1W(h3, ((j + 48u) * ENC_C + (n) * 16u), xn)
+#else
+#define FC1_T8(cn, xn, n) F1W(h0, (j * ENC_C + (n) * 16u), xn) F1W(h1, ((j + 16u) * ENC_C + (n) * 16u), xn)
+#endif
+        FOR_NX(FC1_T8)
+        F2B g0, g1;
+        G8B(g0, h0) G8B(g1, h1)
+#if MLP64
+        F2B g2, g3;
+        G8B(g2, h2) G8B(g3, h3)
+#define FC2_T8(cn, xn, n) F2W(cn##_8, ((n) * 16u * HID + j), g0) F2W(cn##_8, ((n) * 16u * HID + j + 16u), g1) \
+            F2W(cn##_8, ((n) * 16u * HID + j + 32u), g2) F2W(cn##_8, ((n) * 16u * HID + j + 48u), g3)
+#else
+#define FC2_T8(cn, xn, n) F2W(cn##_8, ((n) * 16u * HID + j), g0) F2W(cn##_8, ((n) * 16u * HID + j + 16u), g1)
+#endif
+        FOR_NX(FC2_T8)
+    }
+#define FC2E_T(cn, xn, n) cn = ACC(cn##_8 F8MUL);
+    FOR_NX(FC2E_T)
+#else
+#define FC2B_T(cn, xn, n) cn = bias_acc_t(pc.fc2_b, (n) * 16u);
+    FOR_NX(FC2B_T)
     J_UNROLL for (uint j = 0u; j < LT_HID; j += SLICE) {
         // hidden slice h^T [SLICE neurons][16 rows] = fc1 x1^T + b, GELU in registers
         ACC h0 = bias_acc_t(pc.fc1_b, j), h1 = bias_acc_t(pc.fc1_b, j + 16u);
@@ -978,6 +1170,7 @@ void main() {
 #endif
         FOR_NX(FC2_T)
     }
+#endif
 #define X2_T(cn, xn, n) RESID_T(cn, xn, ls2)
     FOR_NX(X2_T)
 #endif

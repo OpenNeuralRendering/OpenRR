@@ -33,3 +33,7 @@ set(LX_DEFS_enc0_stage_32_64 LT_FAR=2 LT_FAR1=2 LT_Q16=1 LT_VO=1 LT_SYM=1 LT_GEL
 set(LX_DEFS_dec_up_32_64_64 LT_FAR=3 LT_FAR1=3 LT_Q16=1 LT_VO=1 LT_SYM=1 LT_GELU=0.31 LT_UP8=1 LT_EXP=1 LT_RCP=1 LT_HM=1)
 set(LX_DEFS_dec_head_32_64 LT_FAR=2 LT_FAR1=2 LT_Q16=1 LT_VO=1 LT_SYM=1 LT_GELU=0.31 LT_EXP=1 LT_RCP=1 LT_HM=1)
 set(LT_ENGINE_DEEP "2,4,2,4")
+# FP8 (OnrRrSetFp8, experimental, off unless the host asks): these _lt kernels again as _l8, their MLP in e4m3 with an f32 sum
+# (LT_F8MLP) and the GELU on the fp16 path (LT_F8G16, "g16"). About 1-2% off the New frame; very bright isolated points change
+# (q_impulse grad 0.82, its worst frame as base), hence experimental.
+set(F8_KERNELS dec_up_64_64_96 dec_dfn_64_64 enc_stage_96_128_128 dec_dfn_96_128 dec_up_96_128_128 dec_up_128_128_160 dec_dfn_128_128)

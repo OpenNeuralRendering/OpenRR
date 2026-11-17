@@ -438,7 +438,9 @@ uint e4m3_out(float16_t x) {
     return ((uint(float16BitsToUint16(m)) >> 7) - 0x40u) & 0x7fu | ((b >> 8) & 0x80u);
 }
 
-int reflect_i(int i, int n) { i = abs(i); return min(i, 2 * n - 2 - i); }
+// mirror index without repeating the edge; folded twice, so it stays inside [0, n) when a window reaches past the
+// first reflection (levels smaller than a window at tiny render sizes; one fold read before the buffer)
+int reflect_i(int i, int n) { i = abs(min(abs(i), 2 * n - 2 - abs(i))); return max(min(i, 2 * n - 2 - i), 0); }
 
 float16_t exp_bits(float16_t s) {
     precise float16_t z = clamp(s * SCORE_SCALE, -CAP, CAP);

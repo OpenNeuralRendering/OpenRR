@@ -44,11 +44,12 @@ thread_local std::string t_error;
 
 // contexts alive in the process. The flow kernels' windows spin on row flags, which only holds while one network runs
 // at a time: two of them on two queues can fill the GPU with waiting windows whose producers never get launched (a
-// GPU hang; Indiana Jones creates a second, small feature for another view). With more than one context every level
-// keeps its barrier, and on a Vulkan game's device always (its features come and go with others in flight).
-// ONR_RR_FLOW=0: never, =1: always (measurements).
+// GPU hang; Indiana Jones creates a second, small feature for another view). Off by default since 0.1.7: the busy wait
+// is a TDR risk and the barriers give the same bits in the same time (opt-loop 2026-11-13). ONR_RR_FLOW=1 loads the
+// _fl kernels and uses them always (measurements only).
 std::atomic<int> g_live{0};
-const char* const g_flow = getenv("ONR_RR_FLOW");
+const char* const g_flow_env = getenv("ONR_RR_FLOW");
+const bool g_flow = g_flow_env && strcmp(g_flow_env, "0") != 0;
 
 int32_t fail(int32_t code, const std::string& what) {
     t_error = what;
@@ -385,6 +386,11 @@ struct Ctx {
     int lx_logged = -1;
     std::atomic<bool> lite_want{false}, lite_started{false}, lite_built{false}, lite_failed{false};
     std::thread lite_builder;
+    // FP8 (OnrRrSetFp8): the mode's sets again with the _l8 kernels in front, built after the mode's on the first frame that asks
+    Kernels net_l8, net_lx8;
+    std::atomic<bool> f8_want{false}, f8_started{false}, f8_built{false}, f8_failed{false};
+    std::thread f8_builder;
+    int f8_logged = -1;
     bool lite_logged = false;
     std::atomic<bool> built{false};
     std::atomic<bool> building{false};
@@ -482,8 +488,10 @@ void load_wide(Kernels& k, Gpu& d, const std::wstring& dir) {
     }
 }
 
-// the small levels without barriers between them (Engine::flow_kernel_names); without them each keeps its barrier
+// the small levels without barriers between them (Engine::flow_kernel_names), only with ONR_RR_FLOW=1; without them
+// each keeps its barrier
 void load_flow(Kernels& k, Gpu& d, const std::wstring& dir) {
+    if (!g_flow) return;
     try {
         k.load(d, utf8(dir), Engine::flow_kernel_names());
     } catch (const std::exception& e) {
@@ -571,6 +579,8 @@ void build_network(Ctx* c) {
     c->building = false;
 }
 
+void build_f8(Ctx* c);
+
 // the cheaper kernels, beside the running ones; until they are ready the frames stay on the others
 void build_lite(Ctx* c) {
     Gpu& d = c->use_d3d ? static_cast<Gpu&>(*c->dx) : static_cast<Gpu&>(c->dev);
@@ -587,10 +597,35 @@ void build_lite(Ctx* c) {
               c->use_d3d ? c->dx->cache_hits() - h0 : 0, c->use_d3d ? c->dx->cache_misses() - m0 : 0,
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         c->lite_built = true;
+        if (c->f8_want && !c->f8_started.exchange(true)) build_f8(c);   // asked with the mode: right after it, on this thread
     } catch (const std::exception& e) {
         { std::lock_guard l(c->m); c->net_lite.unload(d); c->net_lx.unload(d); }
         c->lite_failed = true;
         g_log("fast mode not available: %s", e.what());
+    }
+}
+
+// the FP8 sets: _l8 where there is one, the mode's kernels for the rest (and the experimental level's _lx in front of both)
+void build_f8(Ctx* c) {
+    Gpu& d = c->use_d3d ? static_cast<Gpu&>(*c->dx) : static_cast<Gpu&>(c->dev);
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        load_each(c, c->net_l8, d, c->net.names(), "_l8");
+        const size_t n8 = c->net_l8.names().size();
+        if (!n8) throw std::runtime_error("no *_l8 kernels in the shader folder");
+        load_each(c, c->net_l8, d, c->net.names(), "_lt");
+        if (!c->net_lx.names().empty()) {
+            load_each(c, c->net_lx8, d, c->net.names(), "_lx");
+            load_each(c, c->net_lx8, d, c->net.names(), "_l8");
+            load_each(c, c->net_lx8, d, c->net.names(), "_lt");
+        }
+        g_log("fp8 kernels ready (%zu of their own) in %.2f s", n8,
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        c->f8_built = true;
+    } catch (const std::exception& e) {
+        { std::lock_guard l(c->m); c->net_l8.unload(d); c->net_lx8.unload(d); }
+        c->f8_failed = true;
+        g_log("fp8 not available: %s", e.what());
     }
 }
 
@@ -666,6 +701,7 @@ EngineFrame engine_frame(const Ctx* c, const Job& j) {
     memcpy(ef.view_to_clip, f.view_to_clip, sizeof ef.view_to_clip);
     ef.depth_sign = sign;
     ef.reset = (f.flags & ONR_RR_FRAME_RESET) != 0;
+    ef.mv_jittered = (f.flags & ONR_RR_FRAME_MV_JITTERED) != 0;
     if (j.in[G_TL].present) ef.transparency = c->guides[G_TL].addr;
     if (j.in[G_DM].present) ef.disocclusion = c->guides[G_DM].addr;
     if (j.in[G_SSS].present) ef.sss = c->guides[G_SSS].addr;
@@ -838,10 +874,10 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
     }
     if (network) {
         d.barrier();
-        const bool flow = g_flow ? strcmp(g_flow, "0") != 0 : !c->vk_host && g_live.load() == 1;
+        const bool flow = g_flow;
         c->engine.set_flow(flow);
         if (int(flow) != c->logged_flow) {
-            g_log("small levels: %s", flow ? "row flags" : c->vk_host && !g_flow ? "barriers (Vulkan host)" : "barriers (more than one network, or ONR_RR_FLOW=0)");
+            g_log("small levels: %s", flow ? "row flags (ONR_RR_FLOW=1)" : "barriers");
             c->logged_flow = int(flow);
         }
         EngineFrame ef = engine_frame(c, j);
@@ -1007,9 +1043,16 @@ bool prepare_network(Ctx* c, Gpu& d, I2 render, F&& idle) {
     }
     const bool network = c->engine_ready && c->state == ONR_RR_STATE_READY && c->engine.kernels() != nullptr;
     if (network && c->lite_want && !c->lite_started.exchange(true)) c->lite_builder = std::thread(build_lite, c);
+    // after the mode's build, never beside it
+    if (network && c->lite_built && c->f8_want && !c->f8_started.exchange(true)) c->f8_builder = std::thread(build_f8, c);
     if (network && c->lite_built) {
         const bool lx = c->lx_want && !c->net_lx.names().empty();
-        c->engine.set_lite(lx ? &c->net_lx : &c->net_lite);
+        const bool f8 = c->f8_want && c->f8_built;
+        c->engine.set_lite(f8 ? (lx ? &c->net_lx8 : &c->net_l8) : lx ? &c->net_lx : &c->net_lite);
+        if (c->lite_want && c->f8_logged != int(f8)) {
+            c->f8_logged = f8;
+            g_log("fp8 %s at frame %llu", f8 ? "on" : "off", (unsigned long long)c->frames);
+        }
         c->engine.set_deep_on(lx);
         c->engine.set_lite_on(c->lite_want);
         if (c->lite_want && c->lx_logged != int(lx)) {
@@ -1113,12 +1156,15 @@ int32_t enqueue(Ctx* c, Job& j, ID3D12CommandQueue* q, uint32_t* exported = null
 void free_ctx(Ctx* c) {
     if (c->builder.joinable()) c->builder.join();
     if (c->lite_builder.joinable()) c->lite_builder.join();
+    if (c->f8_builder.joinable()) c->f8_builder.join();
     if (c->stats_thread.joinable()) c->stats_thread.join();
     // the game's own device is idle at Destroy (the host's contract); waiting on it would race the game's queues
     if (c->dev.vk() && !c->vk_host) vkDeviceWaitIdle(c->dev.vk());
     c->engine.destroy();
     // the network was built on D3D12 only while that backend stayed on
     Gpu& net = c->use_d3d ? static_cast<Gpu&>(*c->dx) : c->dev;
+    c->net_l8.unload(net);
+    c->net_lx8.unload(net);
     c->net_lite.unload(net);
     c->net_lx.unload(net);
     c->net.unload(net);
@@ -1181,6 +1227,7 @@ void destroy_ctx(Ctx* c) {
         c->quit = true;
         if (c->builder.joinable()) c->builder.join();
         if (c->lite_builder.joinable()) c->lite_builder.join();
+        if (c->f8_builder.joinable()) c->f8_builder.join();
         std::lock_guard l(g_retired_m);
         g_retired.push_back({c->dev.vk(), c, 0});
         return;
@@ -2914,6 +2961,24 @@ extern "C" int32_t OnrRrGetFastMode(void* context) {
     if (c->lite_failed) return 3;
     if (!c->lite_built) return 2;
     return c->lx_want && !c->net_lx.names().empty() ? 4 : 1;
+}
+
+// FP8 (experimental, off by default): the _l8 kernels in the fast mode and its experimental level; Legacy ignores it. Safe every
+// frame; the first frame asked, with the mode built, starts the build, and the next recorded frame after it uses them.
+extern "C" int32_t OnrRrSetFp8(void* context, int32_t on) {
+    if (!context) return ONR_RR_INVALID_ARGUMENT;
+    static_cast<Ctx*>(context)->f8_want = on != 0;
+    return ONR_RR_OK;
+}
+
+// 0 off, 1 on, 2 asked and its kernels still building, 3 asked and not available, 4 asked and the mode does not use it (Legacy)
+extern "C" int32_t OnrRrGetFp8(void* context) {
+    if (!context) return 0;
+    auto* c = static_cast<Ctx*>(context);
+    if (!c->f8_want) return 0;
+    if (c->f8_failed || c->lite_failed) return 3;
+    if (!c->lite_want) return 4;
+    return c->f8_built ? 1 : 2;
 }
 
 extern "C" int32_t OnrRrSetDeltaRate(void* context, float rate) {

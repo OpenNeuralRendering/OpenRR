@@ -66,8 +66,8 @@ extern "C" {
 #define ONR_RR_ABI_VERSION_4 4
 #define ONR_RR_ABI_VERSION_5 5
 
-#define ONR_RR_RUNTIME_VERSION "0.1.6"
-#define ONR_RR_RUNTIME_VERSION_RC 0, 1, 6, 0
+#define ONR_RR_RUNTIME_VERSION "0.1.7"
+#define ONR_RR_RUNTIME_VERSION_RC 0, 1, 7, 0
 
 enum OnrRrResult {
     ONR_RR_OK = 0,
@@ -359,6 +359,20 @@ int32_t OnrRrSetFastMode(void* context, int32_t on);
 __declspec(dllexport)
 #endif
 int32_t OnrRrGetFastMode(void* context);
+// Experimental FP8, resolved by name as the two above (an older DLL has none): part of the fast mode's MLP (7 kernels,
+// C = 64..128) in e4m3 with an f32 sum, ~1-2.4% off the frame; very bright isolated points may change. Only with the fast mode on
+// (both its levels); Legacy ignores it. on: 0 off (the default, the same frames as without the call), 1 on. Takes effect on the
+// next recorded frame, keeping every history; the kernels are built on the first frame that asks with the mode built. Before
+// Record, on the render thread. Get: 0 off, 1 on, 2 building, 3 not available (no *_l8 kernels in the shader folder), 4 asked
+// and the mode is off (Legacy).
+#ifdef ONR_RR_BUILDING
+__declspec(dllexport)
+#endif
+int32_t OnrRrSetFp8(void* context, int32_t on);
+#ifdef ONR_RR_BUILDING
+__declspec(dllexport)
+#endif
+int32_t OnrRrGetFp8(void* context);
 
 #ifdef __cplusplus
 }

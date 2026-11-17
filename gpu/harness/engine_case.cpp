@@ -97,7 +97,7 @@ int run_engine(Ctx& c, const fs::path& dll, const fs::path& dir) {
                 auto pp = fr[f - 1].read<uint32_t>("prm.f32");
                 memcpy(&pj[0], &pp[(0x2f0 - 0x160) / 4], 4), memcpy(&pj[1], &pp[(0x2f4 - 0x160) / 4], 4);
             }
-            Enc0BlockInput bi{render, {2880, 1620}, {1440, 810}, {ef.jitter[0], ef.jitter[1]}, {pj[0], pj[1]}, {1, 1},
+            Enc0BlockInput bi{render, {2880, 1620}, {1440, 810}, {ef.jitter[0], ef.jitter[1]}, {pj[0], pj[1]}, {1, 1}, {0, 0},
                               ef.world_to_view, ef.view_to_clip, ef.world_to_view, ef.view_to_clip, w.enc0_scalars};
             auto b = enc0_block(bi);
             ours.assign(b.begin(), b.end());

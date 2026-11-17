@@ -32,7 +32,9 @@ layout(push_constant, scalar) uniform P {
 
 shared floate4m3_t x8[64 * ENC_C];
 
-int reflect_i(int i, int n) { i = abs(i); return min(i, 2 * n - 2 - i); }
+// mirror index without repeating the edge; folded twice, so it stays inside [0, n) when a window reaches past the
+// first reflection (levels smaller than a window at tiny render sizes; one fold read before the buffer)
+int reflect_i(int i, int n) { i = abs(min(abs(i), 2 * n - 2 - abs(i))); return max(min(i, 2 * n - 2 - i), 0); }
 
 uint ocp_code(uint b) {
     if ((b & 0x78u) != 0u) return b;
